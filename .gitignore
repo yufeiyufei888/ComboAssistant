@@ -1,0 +1,12 @@
+.gradle/
+.gradle-user-home/
+.tooling/
+.idea/
+local.properties
+**/build/
+*.apk
+*.aab
+*.jks
+*.keystore
+captures/
+app/src/androidTest/screenshots/failed/

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">连招助手</string>
+    <string name="accessibility_service_name">连招助手触控服务</string>
+    <string name="accessibility_service_description">仅在用户明确录制或点击连招按键后，显示可信悬浮层并执行用户保存的确定性触控序列。不读取屏幕文字、截图或账号信息。</string>
+</resources>
