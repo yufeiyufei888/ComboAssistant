@@ -11,13 +11,22 @@ import com.yufei.comboassistant.domain.PointerStroke
 import com.yufei.comboassistant.domain.TouchSample
 
 data class CapturedGesture(
-    val downElapsedMs: Long,
+    val downUptimeMs: Long,
+    val upUptimeMs: Long,
     val strokes: List<PointerStroke>,
-)
+) {
+    @Deprecated("Use downUptimeMs; MotionEvent timestamps use the uptime clock")
+    val downElapsedMs: Long get() = downUptimeMs
+}
+
+enum class CaptureCancelReason {
+    MOTION_EVENT_CANCELLED,
+}
 
 class CaptureOverlayView(
     context: Context,
     private val onCaptured: (CapturedGesture) -> Unit,
+    private val onCancelled: (CaptureCancelReason) -> Unit = {},
 ) : View(context) {
     private data class MutableStroke(
         val pointerId: Int,
@@ -50,7 +59,7 @@ class CaptureOverlayView(
 
     private var armed = false
     private var statusText = "准备录制"
-    private var gestureDownMs = 0L
+    private var gestureDownUptimeMs = 0L
 
     init {
         setBackgroundColor(Color.argb(24, 0, 0, 0))
@@ -58,13 +67,14 @@ class CaptureOverlayView(
 
     fun showCountdown(value: Int) {
         armed = false
+        clearGesture()
         statusText = value.toString()
         invalidate()
     }
 
     fun setArmed(value: Boolean) {
         armed = value
-        statusText = if (value) "录制中 · 抬手后镜像" else "正在镜像手势…"
+        statusText = if (value) "录制中 · 点击结束后保存" else "录制已暂停"
         if (!value) clearGesture()
         invalidate()
     }
@@ -74,7 +84,7 @@ class CaptureOverlayView(
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 clearGesture()
-                gestureDownMs = event.downTime
+                gestureDownUptimeMs = event.downTime
                 startPointer(event.getPointerId(0), event.eventTime)
                 addSamples(event)
             }
@@ -84,15 +94,20 @@ class CaptureOverlayView(
             }
             MotionEvent.ACTION_MOVE -> addSamples(event)
             MotionEvent.ACTION_POINTER_UP -> {
-                addSamples(event)
+                addSamples(event, forceCurrent = true)
                 finishPointer(event.getPointerId(event.actionIndex))
             }
             MotionEvent.ACTION_UP -> {
-                addSamples(event)
+                addSamples(event, forceCurrent = true)
                 finishPointer(event.getPointerId(event.actionIndex))
-                deliverGesture()
+                deliverGesture(event.eventTime)
             }
-            MotionEvent.ACTION_CANCEL -> clearGesture()
+            MotionEvent.ACTION_CANCEL -> {
+                armed = false
+                statusText = "触摸流已取消"
+                clearGesture()
+                onCancelled(CaptureCancelReason.MOTION_EVENT_CANCELLED)
+            }
         }
         invalidate()
         return true
@@ -119,11 +134,11 @@ class CaptureOverlayView(
         active.putIfAbsent(pointerId, MutableStroke(pointerId, eventTimeMs))
     }
 
-    private fun addSamples(event: MotionEvent) {
+    private fun addSamples(event: MotionEvent, forceCurrent: Boolean = false) {
         for (historyIndex in 0 until event.historySize) {
             val time = event.getHistoricalEventTime(historyIndex)
             for (pointerIndex in 0 until event.pointerCount) {
-                active[event.getPointerId(pointerIndex)]?.samples?.add(
+                active[event.getPointerId(pointerIndex)]?.appendSample(
                     RawSample(
                         eventTimeMs = time,
                         x = event.getHistoricalX(pointerIndex, historyIndex),
@@ -133,22 +148,42 @@ class CaptureOverlayView(
             }
         }
         for (pointerIndex in 0 until event.pointerCount) {
-            active[event.getPointerId(pointerIndex)]?.samples?.add(
-                RawSample(event.eventTime, event.getX(pointerIndex), event.getY(pointerIndex)),
+            active[event.getPointerId(pointerIndex)]?.appendSample(
+                sample = RawSample(event.eventTime, event.getX(pointerIndex), event.getY(pointerIndex)),
+                force = forceCurrent,
             )
         }
+    }
+
+    private fun MutableStroke.appendSample(sample: RawSample, force: Boolean = false) {
+        if (!sample.x.isFinite() || !sample.y.isFinite()) return
+        if (sample.eventTimeMs < downTimeMs) return
+        val previous = samples.lastOrNull()
+        if (previous != null && sample.eventTimeMs < previous.eventTimeMs) return
+        if (!force && previous != null && sample.eventTimeMs - previous.eventTimeMs < SAMPLE_INTERVAL_MS) {
+            return
+        }
+        if (samples.size >= MAX_SAMPLES_PER_STROKE) {
+            if (force) samples[samples.lastIndex] = sample
+            return
+        }
+        if (previous != sample) samples += sample
     }
 
     private fun finishPointer(pointerId: Int) {
         active.remove(pointerId)?.let(completed::add)
     }
 
-    private fun deliverGesture() {
-        if (completed.isEmpty()) return
+    private fun deliverGesture(upUptimeMs: Long) {
+        if (completed.isEmpty()) {
+            clearGesture()
+            return
+        }
         val firstDown = completed.minOf { it.downTimeMs }
         val viewWidth = width.coerceAtLeast(1).toFloat()
         val viewHeight = height.coerceAtLeast(1).toFloat()
-        val strokes = completed.map { stroke ->
+        val strokes = completed.mapNotNull { stroke ->
+            if (stroke.samples.isEmpty()) return@mapNotNull null
             PointerStroke(
                 pointerId = stroke.pointerId,
                 startOffsetMs = (stroke.downTimeMs - firstDown).coerceAtLeast(0L),
@@ -165,8 +200,14 @@ class CaptureOverlayView(
                     },
             )
         }
-        armed = false
-        onCaptured(CapturedGesture(gestureDownMs, strokes))
+        val captured = CapturedGesture(
+            downUptimeMs = gestureDownUptimeMs,
+            upUptimeMs = upUptimeMs,
+            strokes = strokes,
+        )
+        // Clear before notifying so callback-triggered window changes cannot leave stale pointers.
+        clearGesture()
+        onCaptured(captured)
     }
 
     private fun clearGesture() {
@@ -184,5 +225,11 @@ class CaptureOverlayView(
         )
         val base = colors[index % colors.size]
         return Color.argb(alpha, Color.red(base), Color.green(base), Color.blue(base))
+    }
+
+    private companion object {
+        // Bound a 60-second recording while retaining enough resolution for touch playback.
+        const val SAMPLE_INTERVAL_MS = 8L
+        const val MAX_SAMPLES_PER_STROKE = 7_500
     }
 }

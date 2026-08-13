@@ -22,7 +22,6 @@ object DatabaseModule {
     @Singleton
     fun provideDatabase(@ApplicationContext context: Context): ComboDatabase =
         Room.databaseBuilder(context, ComboDatabase::class.java, "combo-assistant.db")
-            .fallbackToDestructiveMigration(false)
             .build()
 
     @Provides

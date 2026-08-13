@@ -17,6 +17,9 @@ interface ComboDao {
     @Upsert
     suspend fun upsert(combo: ComboEntity)
 
+    @Upsert
+    suspend fun upsertAll(combos: List<ComboEntity>)
+
     @Delete
     suspend fun delete(combo: ComboEntity)
 

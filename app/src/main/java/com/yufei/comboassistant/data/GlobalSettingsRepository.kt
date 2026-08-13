@@ -17,6 +17,7 @@ data class GlobalSettings(
     val disclosureAccepted: Boolean = false,
     val floatingBallEnabled: Boolean = true,
     val buttonsHidden: Boolean = false,
+    val enhancedForegroundDetection: Boolean = false,
     val ballX: Float = 0.04f,
     val ballY: Float = 0.42f,
 )
@@ -29,6 +30,7 @@ class GlobalSettingsRepository @Inject constructor(
         val disclosureAccepted = booleanPreferencesKey("disclosure_accepted")
         val floatingBallEnabled = booleanPreferencesKey("floating_ball_enabled")
         val buttonsHidden = booleanPreferencesKey("buttons_hidden")
+        val enhancedForegroundDetection = booleanPreferencesKey("enhanced_foreground_detection")
         val ballX = floatPreferencesKey("ball_x")
         val ballY = floatPreferencesKey("ball_y")
     }
@@ -38,6 +40,7 @@ class GlobalSettingsRepository @Inject constructor(
             disclosureAccepted = prefs[Keys.disclosureAccepted] ?: false,
             floatingBallEnabled = prefs[Keys.floatingBallEnabled] ?: true,
             buttonsHidden = prefs[Keys.buttonsHidden] ?: false,
+            enhancedForegroundDetection = prefs[Keys.enhancedForegroundDetection] ?: false,
             ballX = prefs[Keys.ballX] ?: 0.04f,
             ballY = prefs[Keys.ballY] ?: 0.42f,
         )
@@ -46,6 +49,8 @@ class GlobalSettingsRepository @Inject constructor(
     suspend fun setDisclosureAccepted(value: Boolean) = update(Keys.disclosureAccepted, value)
     suspend fun setFloatingBallEnabled(value: Boolean) = update(Keys.floatingBallEnabled, value)
     suspend fun setButtonsHidden(value: Boolean) = update(Keys.buttonsHidden, value)
+    suspend fun setEnhancedForegroundDetection(value: Boolean) =
+        update(Keys.enhancedForegroundDetection, value)
 
     suspend fun setBallPosition(x: Float, y: Float) {
         context.comboSettingsDataStore.edit {

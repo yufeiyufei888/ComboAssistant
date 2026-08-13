@@ -14,6 +14,7 @@ interface ComboRepository {
     fun observeAll(): Flow<List<Combo>>
     suspend fun getById(id: String): Combo?
     suspend fun save(combo: Combo)
+    suspend fun saveAll(combos: List<Combo>)
     suspend fun delete(id: String)
 }
 
@@ -22,36 +23,44 @@ class RoomComboRepository @Inject constructor(
     private val dao: ComboDao,
     private val json: Json,
 ) : ComboRepository {
-    override fun observeAll(): Flow<List<Combo>> = dao.observeAll().map { rows -> rows.map(::toDomain) }
-
-    override suspend fun getById(id: String): Combo? = dao.getById(id)?.let(::toDomain)
-
-    override suspend fun save(combo: Combo) {
-        val value = combo.normalized()
-        dao.upsert(
-            ComboEntity(
-                id = value.id,
-                name = value.name,
-                targetPackage = value.targetPackage,
-                orientation = value.orientation.name,
-                recordedWidth = value.recordedWidth,
-                recordedHeight = value.recordedHeight,
-                buttonX = value.buttonX,
-                buttonY = value.buttonY,
-                buttonSizeDp = value.buttonSizeDp,
-                buttonOpacity = value.buttonOpacity,
-                speed = value.speed,
-                repeatCount = value.repeatCount,
-                repeatIntervalMs = value.repeatIntervalMs,
-                visible = value.visible,
-                timelineJson = json.encodeToString(MacroTimeline.serializer(), value.timeline),
-                createdAt = value.createdAt,
-                updatedAt = value.updatedAt,
-            ),
-        )
+    override fun observeAll(): Flow<List<Combo>> = dao.observeAll().map { rows ->
+        rows.mapNotNull { row -> runCatching { toDomain(row) }.getOrNull() }
     }
 
+    override suspend fun getById(id: String): Combo? = dao.getById(id)?.let { row ->
+        runCatching { toDomain(row) }.getOrNull()
+    }
+
+    override suspend fun save(combo: Combo) {
+        dao.upsert(toEntity(combo))
+    }
+
+    override suspend fun saveAll(combos: List<Combo>) = dao.upsertAll(combos.map(::toEntity))
+
     override suspend fun delete(id: String) = dao.deleteById(id)
+
+    private fun toEntity(combo: Combo): ComboEntity {
+        val value = combo.normalized()
+        return ComboEntity(
+            id = value.id,
+            name = value.name,
+            targetPackage = value.targetPackage,
+            orientation = value.orientation.name,
+            recordedWidth = value.recordedWidth,
+            recordedHeight = value.recordedHeight,
+            buttonX = value.buttonX,
+            buttonY = value.buttonY,
+            buttonSizeDp = value.buttonSizeDp,
+            buttonOpacity = value.buttonOpacity,
+            speed = value.speed,
+            repeatCount = value.repeatCount,
+            repeatIntervalMs = value.repeatIntervalMs,
+            visible = value.visible,
+            timelineJson = json.encodeToString(MacroTimeline.serializer(), value.timeline),
+            createdAt = value.createdAt,
+            updatedAt = value.updatedAt,
+        )
+    }
 
     private fun toDomain(row: ComboEntity): Combo = Combo(
         id = row.id,
