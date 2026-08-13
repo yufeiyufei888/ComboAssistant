@@ -64,6 +64,7 @@ class AndroidGesturePerformer(
         display: DisplaySnapshot,
     ): GestureDescription {
         val builder = GestureDescription.Builder()
+        val maxDurationMs = GestureDescription.getMaxGestureDuration()
         segment.strokes.forEach { stroke ->
             val first = stroke.samples.first()
             val path = Path().apply {
@@ -72,11 +73,16 @@ class AndroidGesturePerformer(
                     lineTo(scaleX(sample.x, display.width), scaleY(sample.y, display.height))
                 }
             }
+            val startMs = PlaybackEngine.scaleDelay(stroke.startOffsetMs, speed)
+            val durationMs = PlaybackEngine.scaleStrokeDuration(stroke.durationMs, speed)
+            require(startMs + durationMs <= maxDurationMs) {
+                "缩放后的单个手势超过系统 ${maxDurationMs}ms 上限"
+            }
             builder.addStroke(
                 GestureDescription.StrokeDescription(
                     path,
-                    PlaybackEngine.scaleDelay(stroke.startOffsetMs, speed),
-                    PlaybackEngine.scaleStrokeDuration(stroke.durationMs, speed),
+                    startMs,
+                    durationMs,
                 ),
             )
         }

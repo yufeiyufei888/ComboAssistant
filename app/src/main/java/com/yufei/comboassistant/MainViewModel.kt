@@ -42,6 +42,10 @@ class MainViewModel @Inject constructor(
         settingsRepository.setButtonsHidden(value)
     }
 
+    fun setEnhancedForegroundDetection(value: Boolean) = viewModelScope.launch {
+        settingsRepository.setEnhancedForegroundDetection(value)
+    }
+
     fun save(combo: Combo) = viewModelScope.launch {
         comboRepository.save(combo.copy(updatedAt = System.currentTimeMillis()))
     }

@@ -2,6 +2,7 @@ package com.yufei.comboassistant.service
 
 import android.accessibilityservice.AccessibilityService
 import android.content.BroadcastReceiver
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -14,7 +15,9 @@ import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.os.SystemClock
+import android.provider.Settings
 import android.text.InputType
 import android.view.Gravity
 import android.view.MotionEvent
@@ -25,6 +28,7 @@ import android.view.accessibility.AccessibilityEvent
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.SeekBar
@@ -37,19 +41,48 @@ import com.yufei.comboassistant.TouchTestActivity
 import com.yufei.comboassistant.data.ComboRepository
 import com.yufei.comboassistant.data.GlobalSettings
 import com.yufei.comboassistant.data.GlobalSettingsRepository
+import com.yufei.comboassistant.domain.AppendSegmentResult
 import com.yufei.comboassistant.domain.Combo
 import com.yufei.comboassistant.domain.DisplaySnapshot
-import com.yufei.comboassistant.domain.GestureSegment
-import com.yufei.comboassistant.domain.PrepareSegmentResult
+import com.yufei.comboassistant.domain.MacroTimeline
+import com.yufei.comboassistant.domain.RecordingLimit
 import com.yufei.comboassistant.domain.RecordingSession
 import com.yufei.comboassistant.domain.currentOrientation
+import com.yufei.comboassistant.foreground.AndroidUsageForegroundSource
+import com.yufei.comboassistant.foreground.ForegroundDecision
+import com.yufei.comboassistant.foreground.ForegroundDiagnosticLog
+import com.yufei.comboassistant.foreground.ForegroundDisplayInfo
+import com.yufei.comboassistant.foreground.ForegroundDisplayOrientation
+import com.yufei.comboassistant.foreground.ForegroundObservation
+import com.yufei.comboassistant.foreground.ForegroundObservationKind
+import com.yufei.comboassistant.foreground.ForegroundObservationSource
+import com.yufei.comboassistant.foreground.ForegroundPackageClassifier
+import com.yufei.comboassistant.foreground.ForegroundPackageKind
+import com.yufei.comboassistant.foreground.ForegroundSessionState
+import com.yufei.comboassistant.foreground.ForegroundSessionTracker
+import com.yufei.comboassistant.foreground.ForegroundTransition
+import com.yufei.comboassistant.foreground.HiddenReason
+import com.yufei.comboassistant.foreground.InMemoryForegroundDiagnosticLog
+import com.yufei.comboassistant.foreground.NoOpForegroundDiagnosticLog
+import com.yufei.comboassistant.foreground.SetBasedForegroundPackageClassifier
+import com.yufei.comboassistant.foreground.UsageForegroundSource
+import com.yufei.comboassistant.overlay.CaptureCancelReason
 import com.yufei.comboassistant.overlay.CaptureOverlayView
 import com.yufei.comboassistant.overlay.CapturedGesture
+import com.yufei.comboassistant.overlay.FloatingBallPosition
+import com.yufei.comboassistant.overlay.LayoutSession
+import com.yufei.comboassistant.overlay.OverlayCoordinator
 import com.yufei.comboassistant.playback.AndroidGesturePerformer
-import com.yufei.comboassistant.playback.GestureResult
+import com.yufei.comboassistant.playback.ExecutionGateResult
 import com.yufei.comboassistant.playback.PlaybackEngine
 import com.yufei.comboassistant.playback.PlaybackState
 import dagger.hilt.android.AndroidEntryPoint
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.UUID
+import javax.inject.Inject
+import kotlin.math.abs
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -57,62 +90,112 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
-import java.util.UUID
-import javax.inject.Inject
-import kotlin.math.abs
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 @AndroidEntryPoint
 class ComboAccessibilityService : AccessibilityService() {
     @Inject lateinit var comboRepository: ComboRepository
     @Inject lateinit var settingsRepository: GlobalSettingsRepository
 
+    private data class ComboButtonSpec(
+        val combo: Combo,
+        val display: DisplaySnapshot,
+        val mode: OverlayMode,
+        val selected: Boolean,
+    )
+
+    private data class ComboButtonEntry(
+        val root: FrameLayout,
+        val visual: TextView,
+        val layoutRing: View,
+        val params: WindowManager.LayoutParams,
+    )
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val recordingFinishMutex = Mutex()
+    private val displayTracker = DisplayTracker()
+    private val overlayCoordinator = OverlayCoordinator<String, ComboButtonSpec>()
+    private val debugDiagnostics = if (BuildConfig.DEBUG) InMemoryForegroundDiagnosticLog(200) else null
+
     private lateinit var windowManager: WindowManager
+    private lateinit var powerManager: PowerManager
     private lateinit var gesturePerformer: AndroidGesturePerformer
     private lateinit var playbackEngine: PlaybackEngine
+    private lateinit var foregroundTracker: ForegroundSessionTracker
+    private lateinit var usageForegroundSource: UsageForegroundSource
 
     private var latestCombos: List<Combo> = emptyList()
     private var settings = GlobalSettings()
-    private var currentExternalPackage: String? = null
+    private var debugTouchTestVisible = false
+    private var foregroundSettleJob: Job? = null
+    private var usagePollJob: Job? = null
+    private var displayStabilizeJob: Job? = null
+    private var lastScreenOffWallTimeMs: Long = Long.MIN_VALUE
+
+    private var overlayMode = OverlayMode.LOCKED
+    private var layoutSession: LayoutSession? = null
+    private var layoutTargetPackage: String? = null
+    private var selectedLayoutComboId: String? = null
 
     private var ballView: TextView? = null
     private var ballParams: WindowManager.LayoutParams? = null
     private var panelView: View? = null
     private var editorView: View? = null
-    private val comboButtons = mutableMapOf<String, Pair<TextView, WindowManager.LayoutParams>>()
+    private val comboButtons = mutableMapOf<String, ComboButtonEntry>()
 
     private var playbackStopView: TextView? = null
     private var playbackStopParams: WindowManager.LayoutParams? = null
 
     private var recordingView: CaptureOverlayView? = null
     private var recordingParams: WindowManager.LayoutParams? = null
-    private var recordingStopView: TextView? = null
-    private var recordingStopParams: WindowManager.LayoutParams? = null
+    private var recordingHudView: View? = null
+    private var recordingHudParams: WindowManager.LayoutParams? = null
+    private var recordingHudStatus: TextView? = null
     private var recordingSession: RecordingSession? = null
     private var recordingTargetPackage: String? = null
     private var recordingDisplay: DisplaySnapshot? = null
+    private var recordingState: RecordingState = RecordingState.Idle
     private var recordingCountdownJob: Job? = null
     private var recordingTimeoutJob: Job? = null
+    private var recordingHudJob: Job? = null
 
     private val screenOffReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action == Intent.ACTION_SCREEN_OFF) {
-                playbackEngine.stop("屏幕已关闭")
-                scope.launch { abortRecording("屏幕关闭，录制已取消") }
+            if (intent?.action != Intent.ACTION_SCREEN_OFF || !::foregroundTracker.isInitialized) return
+            lastScreenOffWallTimeMs = System.currentTimeMillis()
+            foregroundTracker.onScreenOff(SystemClock.elapsedRealtime())
+            playbackEngine.stop("屏幕已关闭")
+            cancelLayoutMode(silent = true)
+            activeRecordingSessionId()?.let { sessionId ->
+                scope.launch { finalizeRecording(sessionId, save = false, "屏幕关闭，录制已取消") }
             }
+            refreshOverlays()
         }
     }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+        powerManager = getSystemService(POWER_SERVICE) as PowerManager
+        displayTracker.initialize(displaySnapshot())
+
+        // Resolve the default IME dynamically so changing keyboards while the service stays
+        // connected cannot turn the new input method into a false external-app switch.
+        val classifier = ForegroundPackageClassifier(::classifyObservedPackage)
+        val diagnosticLog: ForegroundDiagnosticLog = debugDiagnostics ?: NoOpForegroundDiagnosticLog
+        foregroundTracker = ForegroundSessionTracker(classifier, diagnostics = diagnosticLog)
+        usageForegroundSource = AndroidUsageForegroundSource(this)
+
         gesturePerformer = AndroidGesturePerformer(this) { playbackStopCenter() }
-        playbackEngine = PlaybackEngine(scope, gesturePerformer)
+        playbackEngine = PlaybackEngine(
+            scope = scope,
+            performer = gesturePerformer,
+            executionGate = { combo -> checkExecutionGate(combo) },
+        )
         ContextCompat.registerReceiver(
             this,
             screenOffReceiver,
@@ -127,193 +210,298 @@ class ComboAccessibilityService : AccessibilityService() {
             }
         }
         scope.launch {
-            settingsRepository.settings.collectLatest {
-                settings = it
+            settingsRepository.settings.collectLatest { newSettings ->
+                val enhancedChanged = settings.enhancedForegroundDetection !=
+                    newSettings.enhancedForegroundDetection
+                settings = newSettings
+                if (enhancedChanged || usagePollJob == null) updateUsagePolling()
                 refreshOverlays()
             }
         }
         scope.launch {
-            playbackEngine.state.collectLatest { state -> handlePlaybackState(state) }
+            playbackEngine.state.collectLatest(::handlePlaybackState)
         }
+        updateUsagePolling()
         refreshOverlays()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        val observedPackage = event?.packageName?.toString() ?: return
+        event ?: return
+        val observedPackage = event.packageName?.toString()?.trim().orEmpty()
+        if (observedPackage.isEmpty() || !::foregroundTracker.isInitialized) return
         val observedClass = event.className?.toString()
-        val candidate = when {
-            BuildConfig.DEBUG &&
-                observedPackage == packageName &&
-                observedClass == TouchTestActivity::class.java.name -> observedPackage
-            observedPackage == packageName && observedClass == MainActivity::class.java.name -> {
-                stopForForegroundChange("已切换到连招助手主界面")
-                return
-            }
-            else -> observedPackage.takeIf(::isExternalPackage) ?: return
+        debugTouchTestVisible = BuildConfig.DEBUG &&
+            observedPackage == packageName &&
+            observedClass == TouchTestActivity::class.java.name
+        if (observedPackage == packageName && observedClass == MainActivity::class.java.name) {
+            debugTouchTestVisible = false
         }
-        if (candidate == currentExternalPackage) return
-        currentExternalPackage = candidate
-
-        val running = playbackEngine.state.value as? PlaybackState.Running
-        if (running != null) {
-            val activeCombo = latestCombos.firstOrNull { it.id == running.comboId }
-            if (activeCombo?.targetPackage != candidate) playbackEngine.stop("已切换到其他应用")
+        val kind = when (event.eventType) {
+            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> ForegroundObservationKind.WINDOW_STATE_CHANGED
+            AccessibilityEvent.TYPE_WINDOWS_CHANGED -> ForegroundObservationKind.WINDOWS_CHANGED
+            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> ForegroundObservationKind.WINDOW_CONTENT_CHANGED
+            else -> return
         }
-        if (recordingSession != null && recordingTargetPackage != candidate) {
-            scope.launch { abortRecording("已切换到其他应用，录制已取消") }
-        }
-        refreshOverlays()
-    }
-
-    private fun stopForForegroundChange(reason: String) {
-        currentExternalPackage = null
-        playbackEngine.stop(reason)
-        if (recordingSession != null) {
-            scope.launch { abortRecording("$reason，录制已取消") }
-        }
-        refreshOverlays()
+        submitForegroundObservation(
+            ForegroundObservation(
+                packageName = observedPackage,
+                className = observedClass,
+                source = ForegroundObservationSource.ACCESSIBILITY,
+                kind = kind,
+                observedAtElapsedRealtimeMs = SystemClock.elapsedRealtime(),
+                // AccessibilityEvent.eventTime uses an uptime clock, not wall time.
+                sourceEventWallTimeMs = null,
+                display = displaySnapshot().toForegroundDisplayInfo(),
+            ),
+        )
     }
 
     override fun onInterrupt() {
+        if (::foregroundTracker.isInitialized) {
+            foregroundTracker.onServiceDisconnected(SystemClock.elapsedRealtime())
+        }
         playbackEngine.stop("无障碍服务被中断")
-        scope.launch { abortRecording("无障碍服务被中断") }
+        cancelLayoutMode(silent = true)
+        activeRecordingSessionId()?.let { sessionId ->
+            scope.launch { finalizeRecording(sessionId, save = false, "无障碍服务被中断，录制已取消") }
+        }
+        refreshOverlays()
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         playbackEngine.stop("屏幕方向或尺寸已改变")
-        scope.launch { abortRecording("屏幕方向或尺寸改变，录制已取消") }
+        cancelLayoutMode(silent = true)
+        activeRecordingSessionId()?.let { sessionId ->
+            scope.launch { finalizeRecording(sessionId, save = false, "屏幕方向或尺寸改变，录制已取消") }
+        }
+        scheduleDisplayStabilization()
         refreshOverlays()
     }
 
     override fun onDestroy() {
         runCatching { unregisterReceiver(screenOffReceiver) }
-        playbackEngine.stop("服务已关闭")
+        foregroundSettleJob?.cancel()
+        usagePollJob?.cancel()
+        displayStabilizeJob?.cancel()
+        if (::playbackEngine.isInitialized) playbackEngine.stop("服务已关闭")
+        recordingSession?.cancel()
         cleanupRecordingWindows()
         removePanel()
         removeEditor()
         removeBall()
-        removeComboButtons()
+        clearComboButtons()
         removePlaybackStop()
         scope.cancel()
         super.onDestroy()
     }
 
+    private fun submitForegroundObservation(observation: ForegroundObservation) {
+        if (
+            observation.source == ForegroundObservationSource.USAGE_STATS &&
+            (!powerManager.isInteractive ||
+                observation.sourceEventWallTimeMs?.let { it <= lastScreenOffWallTimeMs } == true)
+        ) return
+        val transition = foregroundTracker.observe(observation)
+        handleForegroundTransition(transition)
+        if (transition.current is ForegroundSessionState.Candidate) {
+            foregroundSettleJob?.cancel()
+            foregroundSettleJob = scope.launch {
+                delay(320L)
+                handleForegroundTransition(foregroundTracker.settle(SystemClock.elapsedRealtime()))
+            }
+        }
+    }
+
+    private fun handleForegroundTransition(transition: ForegroundTransition) {
+        val current = transition.current
+        val running = playbackEngine.state.value as? PlaybackState.Running
+        val runningTarget = running?.let { state -> latestCombos.firstOrNull { it.id == state.comboId } }
+            ?.targetPackage
+        val guardedTargets = listOfNotNull(
+            runningTarget,
+            recordingTargetPackage,
+            layoutTargetPackage,
+        )
+        val isRealSwitch = isRealForegroundSwitch(
+            previous = transition.previous,
+            current = current,
+            guardedTargets = guardedTargets,
+        )
+        if (isRealSwitch) {
+            playbackEngine.stop("已切换到其他应用")
+            val recordingTarget = recordingTargetPackage
+            val observedTarget = current.activePackageName ?: current.candidatePackageName
+            if (recordingTarget != null && observedTarget != recordingTarget) {
+                activeRecordingSessionId()?.let { sessionId ->
+                    scope.launch {
+                        finalizeRecording(sessionId, save = false, "已切换到其他应用，录制已取消")
+                    }
+                }
+            }
+            cancelLayoutMode(silent = true)
+        } else if (current is ForegroundSessionState.TemporarilyObscured && running != null) {
+            playbackEngine.stop("系统窗口暂时遮挡，回放已停止")
+        }
+        if (transition.decision == ForegroundDecision.SERVICE_DISCONNECTED) {
+            cancelLayoutMode(silent = true)
+        }
+        refreshOverlays()
+    }
+
+    private fun updateUsagePolling() {
+        usagePollJob?.cancel()
+        usagePollJob = null
+        if (!::usageForegroundSource.isInitialized || !settings.enhancedForegroundDetection) return
+        usagePollJob = scope.launch {
+            while (isActive && settings.enhancedForegroundDetection) {
+                if (powerManager.isInteractive && usageForegroundSource.hasUsageAccess()) {
+                    usageForegroundSource.latestForegroundObservation()?.let(::submitForegroundObservation)
+                }
+                delay(1_000L)
+            }
+        }
+    }
+
     private fun refreshOverlays() {
-        if (!::windowManager.isInitialized) return
-        removeComboButtons()
-        if (!settings.disclosureAccepted || recordingSession != null || playbackEngine.state.value is PlaybackState.Running) {
+        if (!::windowManager.isInitialized || !::playbackEngine.isInitialized) return
+        val busy = recordingState !is RecordingState.Idle ||
+            playbackEngine.state.value is PlaybackState.Running
+        if (!settings.disclosureAccepted || busy) {
             removePanel()
             removeEditor()
             removeBall()
+            reconcileComboButtons(emptyMap())
             return
         }
 
-        if (settings.floatingBallEnabled) showBall() else {
+        val ownAppVisible = ::foregroundTracker.isInitialized &&
+            foregroundTracker.state is ForegroundSessionState.OwnApp
+        if (settings.floatingBallEnabled && !ownAppVisible) showOrUpdateBall() else {
             removePanel()
             removeBall()
         }
-        if (settings.buttonsHidden) return
+        reconcileComboButtons(desiredComboButtons())
+        if (panelView != null) {
+            if (overlayMode == OverlayMode.LAYOUT) showLayoutPanel() else showPanel()
+        }
+    }
 
-        val display = displaySnapshot()
-        latestCombos
-            .filter {
-                it.visible &&
-                    it.targetPackage == currentExternalPackage &&
-                    it.orientation == display.orientation
+    private fun desiredComboButtons(): Map<String, ComboButtonSpec> {
+        if (!settings.disclosureAccepted || recordingState !is RecordingState.Idle) return emptyMap()
+        if (playbackEngine.state.value is PlaybackState.Running) return emptyMap()
+        if (overlayMode == OverlayMode.LOCKED && settings.buttonsHidden) return emptyMap()
+        val packageName = foregroundTracker.activePackageName ?: return emptyMap()
+        val display = (displayTracker.state as? DisplayState.Stable)?.snapshot ?: return emptyMap()
+        val source = if (overlayMode == OverlayMode.LAYOUT) {
+            if (layoutTargetPackage != packageName) return emptyMap()
+            layoutSession?.combos().orEmpty()
+        } else {
+            latestCombos
+        }
+        return source.asSequence()
+            .filter { it.visible && it.targetPackage == packageName && it.orientation == display.orientation }
+            .associate { combo ->
+                combo.id to ComboButtonSpec(
+                    combo = combo,
+                    display = display,
+                    mode = overlayMode,
+                    selected = combo.id == selectedLayoutComboId,
+                )
             }
-            .forEach { showComboButton(it, display) }
     }
 
-    private fun showBall() {
-        if (ballView != null) return
-        val display = displaySnapshot()
-        val size = dp(52)
-        val params = overlayParams(size, size).apply {
-            x = (settings.ballX * (display.width - size).coerceAtLeast(0)).toInt()
-            y = (settings.ballY * (display.height - size).coerceAtLeast(0)).toInt()
-        }
-        val view = makePill("连", 0xFF6D5CE7.toInt(), 18f).apply {
-            background = circleBackground(0xFF6D5CE7.toInt())
-            elevation = dp(8).toFloat()
-        }
-        view.setOnTouchListener(
-            DragClickListener(
-                params = params,
-                onClick = { togglePanel() },
-                onPositionSaved = { x, y ->
-                    scope.launch {
-                        settingsRepository.setBallPosition(
-                            x / (display.width - size).coerceAtLeast(1).toFloat(),
-                            y / (display.height - size).coerceAtLeast(1).toFloat(),
-                        )
-                    }
-                },
-            ),
+    private fun reconcileComboButtons(desired: Map<String, ComboButtonSpec>) {
+        overlayCoordinator.reconcile(
+            desired = desired,
+            onRemoved = ::removeComboButton,
+            onUpdated = ::updateComboButton,
+            onAdded = ::addComboButton,
         )
-        windowManager.addView(view, params)
-        ballView = view
-        ballParams = params
     }
 
-    private fun togglePanel() {
-        if (panelView != null) removePanel() else showPanel()
+    private fun addComboButton(id: String, spec: ComboButtonSpec): Boolean {
+        comboButtons[id]?.let { existing ->
+            if (existing.root.isAttachedToWindow) return updateComboButton(id, spec)
+            comboButtons.remove(id)
+        }
+        val hitSize = dp(maxOf(spec.combo.buttonSizeDp, 48f))
+        val params = overlayParams(hitSize, hitSize)
+        val root = FrameLayout(this).apply {
+            isClickable = true
+            isFocusable = true
+            contentDescription = "连招按键：${spec.combo.name}"
+        }
+        val visual = makePill("", 0xFF157BD6.toInt(), 14f)
+        // The root owns the complete >=48dp hit target. If the visual child stays clickable it
+        // consumes touches inside the circle before the root can execute/drag/long-press.
+        visual.isClickable = false
+        visual.isFocusable = false
+        visual.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        val layoutRing = View(this).apply {
+            isClickable = false
+            isFocusable = false
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        }
+        root.addView(visual)
+        // The editing outline is a separate top layer. It intentionally does not inherit the
+        // visual's user-configured alpha, so selected buttons remain obvious even at 20%.
+        root.addView(layoutRing)
+        val entry = ComboButtonEntry(root, visual, layoutRing, params)
+        comboButtons[id] = entry
+        applyComboButtonSpec(id, entry, spec)
+        return runCatching {
+            windowManager.addView(root, params)
+            true
+        }.getOrElse {
+            if (!root.isAttachedToWindow) comboButtons.remove(id, entry)
+            false
+        }
     }
 
-    private fun showPanel() {
-        removeEditor()
-        val display = displaySnapshot()
-        val layout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), dp(12), dp(12), dp(12))
-            background = roundedBackground(0xE6292C3A.toInt(), 18f)
-            elevation = dp(10).toFloat()
+    private fun updateComboButton(id: String, spec: ComboButtonSpec): Boolean {
+        val entry = comboButtons[id] ?: return addComboButton(id, spec)
+        applyComboButtonSpec(id, entry, spec)
+        return runCatching {
+            windowManager.updateViewLayout(entry.root, entry.params)
+            true
+        }.getOrElse {
+            if (!entry.root.isAttachedToWindow) comboButtons.remove(id, entry)
+            false
         }
-        layout.addView(panelTitle("连招助手"))
-        layout.addView(panelButton("● 新建录制") { startRecording() })
-        layout.addView(
-            panelButton(if (settings.buttonsHidden) "显示全部连招键" else "隐藏全部连招键") {
-                scope.launch { settingsRepository.setButtonsHidden(!settings.buttonsHidden) }
-                removePanel()
-            },
-        )
-        layout.addView(panelHint("点击连招键执行；拖动改位置；长按编辑参数"))
-        layout.addView(panelButton("打开主界面") { openMainActivity() })
-        layout.addView(panelButton("收起") { removePanel() })
-
-        val width = dp(238)
-        val params = overlayParams(width, WindowManager.LayoutParams.WRAP_CONTENT).apply {
-            val ball = ballParams
-            x = ((ball?.x ?: 0) + dp(58)).coerceAtMost((display.width - width).coerceAtLeast(0))
-            y = (ball?.y ?: dp(80)).coerceIn(0, (display.height - dp(300)).coerceAtLeast(0))
-        }
-        windowManager.addView(layout, params)
-        panelView = layout
     }
 
-    private fun showComboButton(combo: Combo, display: DisplaySnapshot) {
-        val size = dp(combo.buttonSizeDp.toInt())
-        val params = overlayParams(size, size).apply {
-            x = (combo.buttonX * (display.width - size).coerceAtLeast(0)).toInt()
-            y = (combo.buttonY * (display.height - size).coerceAtLeast(0)).toInt()
+    private fun applyComboButtonSpec(id: String, entry: ComboButtonEntry, spec: ComboButtonSpec) {
+        val visualSize = dp(spec.combo.buttonSizeDp)
+        val hitSize = dp(maxOf(spec.combo.buttonSizeDp, 48f))
+        entry.params.width = hitSize
+        entry.params.height = hitSize
+        entry.params.x = (spec.combo.buttonX * (spec.display.width - hitSize).coerceAtLeast(0)).toInt()
+        entry.params.y = (spec.combo.buttonY * (spec.display.height - hitSize).coerceAtLeast(0)).toInt()
+        val visualParams = FrameLayout.LayoutParams(visualSize, visualSize, Gravity.CENTER)
+        entry.visual.layoutParams = visualParams
+        entry.layoutRing.layoutParams = FrameLayout.LayoutParams(visualSize, visualSize, Gravity.CENTER)
+        entry.visual.text = spec.combo.name.trim().take(2).ifBlank { "招" }
+        entry.visual.textSize = if (entry.visual.text.length == 1) 17f else 13f
+        entry.visual.alpha = spec.combo.buttonOpacity
+        entry.visual.background = comboButtonBackground()
+        entry.layoutRing.apply {
+            visibility = if (spec.mode == OverlayMode.LAYOUT) View.VISIBLE else View.GONE
+            alpha = 1f
+            background = layoutRingBackground(spec.selected)
         }
-        val text = combo.name.trim().take(2).ifBlank { "招" }
-        val view = makePill(text, 0xFF157BD6.toInt(), if (text.length == 1) 17f else 13f).apply {
-            alpha = combo.buttonOpacity
-            background = circleBackground(0xFF157BD6.toInt())
-            elevation = dp(6).toFloat()
+        entry.root.contentDescription = if (spec.mode == OverlayMode.LAYOUT) {
+            "布局按键：${spec.combo.name}"
+        } else {
+            "执行连招：${spec.combo.name}"
         }
-        view.setOnTouchListener(comboTouchListener(combo, view, params, display, size))
-        windowManager.addView(view, params)
-        comboButtons[combo.id] = view to params
+        entry.root.setOnTouchListener(comboTouchListener(id, entry.root, entry.params))
     }
 
     private fun comboTouchListener(
-        combo: Combo,
+        comboId: String,
         view: View,
         params: WindowManager.LayoutParams,
-        display: DisplaySnapshot,
-        size: Int,
     ): View.OnTouchListener {
         val touchSlop = ViewConfiguration.get(this).scaledTouchSlop
         var downX = 0f
@@ -323,9 +511,9 @@ class ComboAccessibilityService : AccessibilityService() {
         var moved = false
         var longTriggered = false
         val longPress = Runnable {
-            if (!moved) {
+            if (!moved && overlayMode == OverlayMode.LOCKED) {
                 longTriggered = true
-                openComboEditor(combo)
+                currentCombo(comboId)?.let(::openComboEditor)
             }
         }
         return View.OnTouchListener { _, event ->
@@ -337,7 +525,11 @@ class ComboAccessibilityService : AccessibilityService() {
                     originY = params.y
                     moved = false
                     longTriggered = false
-                    mainHandler.postDelayed(longPress, 600L)
+                    if (overlayMode == OverlayMode.LAYOUT) {
+                        selectLayoutCombo(comboId)
+                    } else {
+                        mainHandler.postDelayed(longPress, 600L)
+                    }
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
@@ -347,26 +539,25 @@ class ComboAccessibilityService : AccessibilityService() {
                         moved = true
                         mainHandler.removeCallbacks(longPress)
                     }
-                    if (moved) {
-                        params.x = (originX + dx.toInt()).coerceIn(0, (display.width - size).coerceAtLeast(0))
-                        params.y = (originY + dy.toInt()).coerceIn(0, (display.height - size).coerceAtLeast(0))
+                    if (moved && overlayMode == OverlayMode.LAYOUT) {
+                        val display = stableDisplay() ?: return@OnTouchListener true
+                        params.x = (originX + dx.toInt())
+                            .coerceIn(0, (display.width - params.width).coerceAtLeast(0))
+                        params.y = (originY + dy.toInt())
+                            .coerceIn(0, (display.height - params.height).coerceAtLeast(0))
+                        layoutSession?.moveCombo(
+                            comboId,
+                            params.x / (display.width - params.width).coerceAtLeast(1).toFloat(),
+                            params.y / (display.height - params.height).coerceAtLeast(1).toFloat(),
+                        )
                         runCatching { windowManager.updateViewLayout(view, params) }
                     }
                     true
                 }
                 MotionEvent.ACTION_UP -> {
                     mainHandler.removeCallbacks(longPress)
-                    when {
-                        moved -> scope.launch {
-                            comboRepository.save(
-                                combo.copy(
-                                    buttonX = params.x / (display.width - size).coerceAtLeast(1).toFloat(),
-                                    buttonY = params.y / (display.height - size).coerceAtLeast(1).toFloat(),
-                                    updatedAt = System.currentTimeMillis(),
-                                ),
-                            )
-                        }
-                        !longTriggered -> playCombo(combo)
+                    if (overlayMode == OverlayMode.LOCKED && !moved && !longTriggered) {
+                        currentCombo(comboId)?.let(::playCombo)
                     }
                     true
                 }
@@ -379,14 +570,265 @@ class ComboAccessibilityService : AccessibilityService() {
         }
     }
 
+    private fun showOrUpdateBall() {
+        val display = displaySnapshot()
+        val size = dp(52)
+        val existingView = ballView
+        val existingParams = ballParams
+        if (existingView != null && existingParams != null) {
+            if (overlayMode == OverlayMode.LOCKED) {
+                existingParams.x = (settings.ballX * (display.width - size).coerceAtLeast(0)).toInt()
+                existingParams.y = (settings.ballY * (display.height - size).coerceAtLeast(0)).toInt()
+                runCatching { windowManager.updateViewLayout(existingView, existingParams) }
+            }
+            existingView.background = ballBackground()
+            existingView.contentDescription = if (overlayMode == OverlayMode.LAYOUT) {
+                "拖动设置球"
+            } else {
+                "打开连招助手设置"
+            }
+            return
+        }
+        val position = if (overlayMode == OverlayMode.LAYOUT) {
+            layoutSession?.ballPosition() ?: FloatingBallPosition(settings.ballX, settings.ballY)
+        } else {
+            FloatingBallPosition(settings.ballX, settings.ballY)
+        }
+        val params = overlayParams(size, size).apply {
+            x = (position.x * (display.width - size).coerceAtLeast(0)).toInt()
+            y = (position.y * (display.height - size).coerceAtLeast(0)).toInt()
+        }
+        val view = makePill("连", 0xFF6D5CE7.toInt(), 18f).apply {
+            background = ballBackground()
+            elevation = dp(8).toFloat()
+        }
+        view.setOnTouchListener(ballTouchListener(view, params))
+        windowManager.addView(view, params)
+        ballView = view
+        ballParams = params
+    }
+
+    private fun ballTouchListener(view: View, params: WindowManager.LayoutParams): View.OnTouchListener {
+        val slop = ViewConfiguration.get(this).scaledTouchSlop
+        var downX = 0f
+        var downY = 0f
+        var originX = 0
+        var originY = 0
+        var moved = false
+        return View.OnTouchListener { _, event ->
+            val display = displaySnapshot()
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downX = event.rawX
+                    downY = event.rawY
+                    originX = params.x
+                    originY = params.y
+                    moved = false
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = event.rawX - downX
+                    val dy = event.rawY - downY
+                    if (abs(dx) > slop || abs(dy) > slop) moved = true
+                    if (moved && overlayMode == OverlayMode.LAYOUT) {
+                        params.x = (originX + dx.toInt())
+                            .coerceIn(0, (display.width - view.width).coerceAtLeast(0))
+                        params.y = (originY + dy.toInt())
+                            .coerceIn(0, (display.height - view.height).coerceAtLeast(0))
+                        layoutSession?.moveBall(
+                            params.x / (display.width - view.width).coerceAtLeast(1).toFloat(),
+                            params.y / (display.height - view.height).coerceAtLeast(1).toFloat(),
+                        )
+                        runCatching { windowManager.updateViewLayout(view, params) }
+                    }
+                    true
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (!moved && overlayMode == OverlayMode.LOCKED) togglePanel()
+                    true
+                }
+                MotionEvent.ACTION_CANCEL -> true
+                else -> false
+            }
+        }
+    }
+
+    private fun togglePanel() {
+        if (panelView != null) removePanel() else showPanel()
+    }
+
+    private fun showPanel() {
+        if (overlayMode == OverlayMode.LAYOUT) return showLayoutPanel()
+        removePanel()
+        removeEditor()
+        val display = displaySnapshot()
+        val layout = panelContainer()
+        layout.addView(panelTitle("连招助手"))
+        layout.addView(panelHint(foregroundSummary()))
+        val candidate = foregroundTracker.candidatePackageName
+        if (candidate != null) {
+            layout.addView(panelButton("确认本次游戏：$candidate") {
+                handleForegroundTransition(
+                    foregroundTracker.confirmCandidate(SystemClock.elapsedRealtime()),
+                )
+            })
+        }
+        layout.addView(panelButton("● 新建连续录制") { startRecording() })
+        layout.addView(panelButton("布局按键") { beginLayoutMode() })
+        layout.addView(
+            panelButton(if (settings.buttonsHidden) "显示全部连招键" else "隐藏全部连招键") {
+                scope.launch { settingsRepository.setButtonsHidden(!settings.buttonsHidden) }
+                removePanel()
+            },
+        )
+        if (BuildConfig.DEBUG) {
+            layout.addView(panelButton("查看识别日志") { showDiagnostics() })
+        }
+        layout.addView(panelHint("正常模式已锁定：短按执行，长按编辑；滑动不会移动按键"))
+        layout.addView(panelButton("打开主界面") { openMainActivity() })
+        layout.addView(panelButton("收起") { removePanel() })
+
+        val width = dp(276)
+        val params = panelParams(width, display, estimatedHeight = dp(420))
+        windowManager.addView(layout, params)
+        panelView = layout
+    }
+
+    private fun beginLayoutMode(preferredCombo: Combo? = null) {
+        val target = foregroundTracker.activePackageName
+        val display = stableDisplay()
+        if (target == null || display == null) {
+            toast("请先确认目标游戏并等待屏幕方向稳定")
+            return
+        }
+        val source = latestCombos
+            .filter { it.targetPackage == target && it.visible && it.orientation == display.orientation }
+            .toMutableList()
+        preferredCombo?.takeIf {
+            it.targetPackage == target && it.visible && it.orientation == display.orientation
+        }?.let { preferred ->
+            source.removeAll { it.id == preferred.id }
+            source += preferred
+        }
+        if (source.isEmpty()) {
+            toast("当前游戏没有可布局的连招键")
+            return
+        }
+        removeEditor()
+        removePanel()
+        overlayMode = OverlayMode.LAYOUT
+        layoutTargetPackage = target
+        layoutSession = LayoutSession(
+            source,
+            FloatingBallPosition(settings.ballX, settings.ballY),
+        )
+        selectedLayoutComboId = preferredCombo?.id?.takeIf { id -> source.any { it.id == id } }
+            ?: source.first().id
+        showOrUpdateBall()
+        reconcileComboButtons(desiredComboButtons())
+        showLayoutPanel()
+    }
+
+    private fun selectLayoutCombo(comboId: String) {
+        if (overlayMode != OverlayMode.LAYOUT || comboId == selectedLayoutComboId) return
+        selectedLayoutComboId = comboId
+        reconcileComboButtons(desiredComboButtons())
+        showLayoutPanel()
+    }
+
+    private fun showLayoutPanel() {
+        if (overlayMode != OverlayMode.LAYOUT) return
+        removePanel()
+        val display = stableDisplay() ?: return
+        val session = layoutSession ?: return
+        val selected = selectedLayoutComboId?.let(session::combo)
+        val layout = panelContainer()
+        layout.addView(panelTitle("布局按键 · 未保存"))
+        layout.addView(panelHint("拖动设置球或连招键；布局期间绝不会执行连招"))
+        if (selected != null) {
+            layout.addView(panelHint("已选择：${selected.name}"))
+            addSeek(
+                parent = layout,
+                title = "按键大小",
+                max = 60,
+                progress = (selected.buttonSizeDp - 36f).toInt(),
+            ) { value, label ->
+                val size = 36f + value
+                label.text = "按键大小：${size.toInt()}dp"
+                session.resizeComboKeepingCenter(
+                    selected.id,
+                    size,
+                    display.width,
+                    display.height,
+                    resources.displayMetrics.density,
+                )
+                reconcileComboButtons(desiredComboButtons())
+            }
+            addSeek(
+                parent = layout,
+                title = "按键透明度",
+                max = 80,
+                progress = (selected.buttonOpacity * 100 - 20).toInt(),
+            ) { value, label ->
+                val opacity = (20 + value) / 100f
+                label.text = "按键透明度：${(opacity * 100).toInt()}%"
+                session.setOpacity(selected.id, opacity)
+                reconcileComboButtons(desiredComboButtons())
+            }
+        }
+        layout.addView(panelButton("完成并锁定") { commitLayoutMode() })
+        layout.addView(panelButton("取消并恢复") { cancelLayoutMode(silent = false) })
+
+        val width = dp(292)
+        val params = panelParams(width, display, estimatedHeight = dp(420))
+        windowManager.addView(layout, params)
+        panelView = layout
+    }
+
+    private fun commitLayoutMode() {
+        val session = layoutSession ?: return
+        val ball = session.ballPosition()
+        val combos = session.committed(System.currentTimeMillis())
+        scope.launch {
+            // Room applies the whole combo position/property set in one transaction. DataStore
+            // is committed afterwards because it cannot share Room's transaction.
+            val saveFailure = runCatching {
+                comboRepository.saveAll(combos)
+                settingsRepository.setBallPosition(ball.x, ball.y)
+            }.exceptionOrNull()
+            if (saveFailure != null) {
+                toast("布局保存失败：${saveFailure.message ?: "本地存储不可用"}")
+                return@launch
+            }
+            overlayMode = OverlayMode.LOCKED
+            layoutSession = null
+            layoutTargetPackage = null
+            selectedLayoutComboId = null
+            removePanel()
+            refreshOverlays()
+            toast("布局已保存并锁定")
+        }
+    }
+
+    private fun cancelLayoutMode(silent: Boolean) {
+        if (overlayMode != OverlayMode.LAYOUT) return
+        overlayMode = OverlayMode.LOCKED
+        layoutSession = null
+        layoutTargetPackage = null
+        selectedLayoutComboId = null
+        removePanel()
+        refreshOverlays()
+        if (!silent) toast("已取消布局并恢复原位置")
+    }
+
     private fun playCombo(combo: Combo) {
+        if (overlayMode != OverlayMode.LOCKED) return
         removePanel()
         removeEditor()
         showPlaybackStop(combo.repeatCount)
         removeBall()
-        removeComboButtons()
-        val started = playbackEngine.play(combo, displaySnapshot(), currentExternalPackage)
-        if (!started) {
+        reconcileComboButtons(emptyMap())
+        if (!playbackEngine.play(combo)) {
             removePlaybackStop()
             refreshOverlays()
             toast((playbackEngine.state.value as? PlaybackState.Failed)?.reason ?: "已有连招正在执行")
@@ -417,18 +859,34 @@ class ComboAccessibilityService : AccessibilityService() {
         }
     }
 
+    private fun checkExecutionGate(combo: Combo): ExecutionGateResult {
+        if (!powerManager.isInteractive) return ExecutionGateResult.Blocked("屏幕未点亮")
+        val activePackage = foregroundTracker.activePackageName
+            ?: return ExecutionGateResult.Blocked(hiddenReasonText(foregroundTracker.hiddenReason))
+        if (activePackage != combo.targetPackage) {
+            return ExecutionGateResult.Blocked("当前应用不是此连招绑定的游戏")
+        }
+        val display = stableDisplay()
+            ?: return ExecutionGateResult.Blocked("屏幕方向或尺寸尚未稳定")
+        if (display.orientation != combo.orientation) {
+            return ExecutionGateResult.Blocked("屏幕方向与录制方向不一致")
+        }
+        return ExecutionGateResult.Allowed(display)
+    }
+
     private fun showPlaybackStop(total: Int) {
         if (playbackStopView != null) return
         val display = displaySnapshot()
-        val width = dp(112)
-        val height = dp(46)
+        val width = dp(120)
+        val height = dp(48)
         val params = overlayParams(width, height).apply {
             x = (display.width - width - dp(20)).coerceAtLeast(0)
             y = dp(20)
         }
         val view = makePill("停止 1/$total", 0xFFD13C4B.toInt(), 14f).apply {
-            background = roundedBackground(0xF2D13C4B.toInt(), 23f)
+            background = roundedBackground(0xF2D13C4B.toInt(), 24f)
             elevation = dp(10).toFloat()
+            contentDescription = "紧急停止回放"
             setOnClickListener { playbackEngine.stop("用户停止") }
         }
         windowManager.addView(view, params)
@@ -448,21 +906,29 @@ class ComboAccessibilityService : AccessibilityService() {
             toast("请先停止当前回放")
             return
         }
-        val target = currentExternalPackage
-        if (target == null) {
-            toast("请先打开目标游戏，再开始录制")
+        if (recordingState !is RecordingState.Idle) {
+            toast("已有录制正在进行")
             return
         }
-        val display = displaySnapshot()
+        val target = foregroundTracker.activePackageName
+        val display = stableDisplay()
+        if (target == null || display == null) {
+            toast("请先确认目标游戏并等待屏幕方向稳定")
+            return
+        }
+        val sessionId = UUID.randomUUID().toString()
         recordingTargetPackage = target
         recordingDisplay = display
         recordingSession = RecordingSession()
+        recordingState = RecordingState.Countdown(sessionId, 3)
         removeBall()
-        removeComboButtons()
+        reconcileComboButtons(emptyMap())
 
-        val capture = CaptureOverlayView(this) { captured ->
-            scope.launch { mirrorCapturedGesture(captured) }
-        }
+        val capture = CaptureOverlayView(
+            context = this,
+            onCaptured = { captured -> onGestureCaptured(sessionId, captured) },
+            onCancelled = { reason -> onCaptureCancelled(sessionId, reason) },
+        )
         val captureParams = overlayParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
@@ -473,132 +939,200 @@ class ComboAccessibilityService : AccessibilityService() {
         windowManager.addView(capture, captureParams)
         recordingView = capture
         recordingParams = captureParams
-
-        val stopWidth = dp(128)
-        val stopHeight = dp(46)
-        val stopParams = overlayParams(stopWidth, stopHeight).apply {
-            x = (display.width - stopWidth - dp(20)).coerceAtLeast(0)
-            y = dp(20)
-        }
-        val stop = makePill("停止并保存", 0xFFD13C4B.toInt(), 14f).apply {
-            background = roundedBackground(0xF2D13C4B.toInt(), 23f)
-            setOnClickListener { scope.launch { finishRecording(save = true, message = "录制已保存") } }
-        }
-        windowManager.addView(stop, stopParams)
-        recordingStopView = stop
-        recordingStopParams = stopParams
+        showRecordingHud(sessionId, display)
 
         recordingCountdownJob = scope.launch {
             for (count in 3 downTo 1) {
+                val current = recordingState as? RecordingState.Countdown ?: return@launch
+                if (current.sessionId != sessionId) return@launch
+                recordingState = current.copy(remainingSeconds = count)
                 capture.showCountdown(count)
+                recordingHudStatus?.text = "${count} 秒后连续录制\n录制时游戏不会响应"
                 delay(1_000L)
             }
-            val session = recordingSession ?: return@launch
-            // MotionEvent.downTime uses the uptime clock, so recording gaps must use the
-            // same clock. elapsedRealtime() would incorrectly absorb time spent in deep sleep.
-            session.start(SystemClock.uptimeMillis())
-            armRecording()
-        }
-    }
-
-    private fun armRecording() {
-        setRecordingWindowsTouchable(true)
-        recordingView?.setArmed(true)
-        recordingTimeoutJob?.cancel()
-        val remaining = (60_000L - (recordingSession?.durationMs ?: 0L)).coerceAtLeast(1L)
-        recordingTimeoutJob = scope.launch {
-            delay(remaining)
-            finishRecording(save = true, message = "已达到 60 秒上限并自动保存")
-        }
-    }
-
-    private suspend fun mirrorCapturedGesture(captured: CapturedGesture) {
-        recordingTimeoutJob?.cancel()
-        val session = recordingSession ?: return
-        val display = recordingDisplay ?: return
-        when (val prepared = session.prepare(captured.strokes, captured.downElapsedMs)) {
-            is PrepareSegmentResult.Invalid -> abortRecording(prepared.message)
-            is PrepareSegmentResult.LimitReached -> finishRecording(save = true, message = prepared.message)
-            is PrepareSegmentResult.Ready -> {
-                setRecordingWindowsTouchable(false)
-                recordingView?.setArmed(false)
-                val mirrorSegment = prepared.segment.copy(gapBeforeMs = 0L)
-                when (gesturePerformer.perform(mirrorSegment, 1f, display)) {
-                    GestureResult.COMPLETED -> {
-                        session.commit(prepared.segment, SystemClock.uptimeMillis())
-                        if (session.segmentCount >= 200) {
-                            finishRecording(save = true, message = "已达到 200 次触摸上限并自动保存")
-                        } else {
-                            armRecording()
-                        }
-                    }
-                    GestureResult.CANCELLED -> abortRecording("镜像手势被系统或用户操作取消")
-                    GestureResult.REJECTED -> abortRecording("系统拒绝镜像手势，此游戏可能不兼容")
+            if ((recordingState as? RecordingState.Countdown)?.sessionId != sessionId) return@launch
+            val startedAt = SystemClock.uptimeMillis()
+            recordingSession?.start(startedAt)
+            recordingState = RecordingState.Capturing(sessionId, startedAt, 0)
+            capture.setArmed(true)
+            recordingTimeoutJob = scope.launch {
+                delay(60_000L)
+                // Finalize in a sibling job: cleanup cancels the timer job, and a timer that
+                // finalizes itself would arrive at the suspending Room save already cancelled.
+                scope.launch {
+                    finalizeRecording(sessionId, save = true, "已达到 60 秒上限并自动保存")
+                }
+            }
+            recordingHudJob = scope.launch {
+                while (isActive && (recordingState as? RecordingState.Capturing)?.sessionId == sessionId) {
+                    updateRecordingHud()
+                    delay(200L)
                 }
             }
         }
     }
 
-    private suspend fun finishRecording(save: Boolean, message: String) {
-        val session = recordingSession ?: return
-        val timeline = session.finish()
-        val target = recordingTargetPackage
-        val display = recordingDisplay
-        cleanupRecordingWindows()
-        if (!save || timeline.segments.isEmpty() || target == null || display == null) {
-            toast(if (timeline.segments.isEmpty()) "没有录到有效动作" else message)
-            refreshOverlays()
-            return
+    private fun showRecordingHud(sessionId: String, display: DisplaySnapshot) {
+        val hud = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(10), dp(10), dp(10), dp(10))
+            background = roundedBackground(0xF22A2D3B.toInt(), 16f)
+            elevation = dp(12).toFloat()
         }
-        val now = System.currentTimeMillis()
-        val combo = Combo(
-            id = UUID.randomUUID().toString(),
-            name = "连招 ${SimpleDateFormat("HH:mm:ss", Locale.CHINA).format(Date(now))}",
-            targetPackage = target,
-            orientation = display.orientation,
-            recordedWidth = display.width,
-            recordedHeight = display.height,
-            timeline = timeline,
-            createdAt = now,
-            updatedAt = now,
-        )
-        comboRepository.save(combo)
-        toast(message)
-        refreshOverlays()
-        openComboEditor(combo)
+        val status = panelHint("3 秒后连续录制\n录制时游戏不会响应").apply {
+            gravity = Gravity.CENTER
+            textSize = 13f
+        }
+        hud.addView(status)
+        hud.addView(panelButton("结束并保存") {
+            scope.launch { finalizeRecording(sessionId, save = true, "录制已保存") }
+        })
+        hud.addView(panelButton("取消录制") {
+            scope.launch { finalizeRecording(sessionId, save = false, "录制已取消") }
+        })
+        val width = dp(176)
+        val params = overlayParams(width, WindowManager.LayoutParams.WRAP_CONTENT).apply {
+            x = (display.width - width - dp(20)).coerceAtLeast(0)
+            y = dp(20)
+        }
+        windowManager.addView(hud, params)
+        recordingHudView = hud
+        recordingHudParams = params
+        recordingHudStatus = status
     }
 
-    private suspend fun abortRecording(message: String) {
-        if (recordingSession == null) return
-        recordingSession?.finish()
-        cleanupRecordingWindows()
-        toast(message)
-        refreshOverlays()
+    private fun onGestureCaptured(sessionId: String, captured: CapturedGesture) {
+        val state = recordingState as? RecordingState.Capturing ?: return
+        if (state.sessionId != sessionId) return
+        val session = recordingSession ?: return
+        when (
+            val result = session.append(
+                strokes = captured.strokes,
+                gestureDownUptimeMs = captured.downUptimeMs,
+                gestureUpUptimeMs = captured.upUptimeMs,
+            )
+        ) {
+            is AppendSegmentResult.Appended -> {
+                recordingState = state.copy(segmentCount = session.segmentCount)
+                updateRecordingHud()
+                result.reachedLimit?.let { limit ->
+                    val message = when (limit) {
+                        RecordingLimit.DURATION -> "已达到 60 秒上限并自动保存"
+                        RecordingLimit.SEGMENT_COUNT -> "已达到 200 次触摸上限并自动保存"
+                    }
+                    scope.launch { finalizeRecording(sessionId, save = true, message) }
+                }
+            }
+            is AppendSegmentResult.LimitReached -> {
+                scope.launch { finalizeRecording(sessionId, save = true, "${result.message}，已自动保存") }
+            }
+            is AppendSegmentResult.Invalid -> {
+                scope.launch { finalizeRecording(sessionId, save = false, result.message) }
+            }
+        }
+    }
+
+    private fun onCaptureCancelled(sessionId: String, reason: CaptureCancelReason) {
+        val message = when (reason) {
+            CaptureCancelReason.MOTION_EVENT_CANCELLED -> "触摸流被系统取消，录制未保存"
+        }
+        scope.launch { finalizeRecording(sessionId, save = false, message) }
+    }
+
+    private fun updateRecordingHud() {
+        val state = recordingState as? RecordingState.Capturing ?: return
+        val elapsedMs = recordingSession?.elapsedDurationMs(SystemClock.uptimeMillis()) ?: 0L
+        recordingHudStatus?.text = String.format(
+            Locale.CHINA,
+            "录制中 %02d.%01d 秒 · %d/200 段\n游戏不会响应；结束后再回放",
+            elapsedMs / 1_000L,
+            (elapsedMs % 1_000L) / 100L,
+            state.segmentCount,
+        )
+    }
+
+    private suspend fun finalizeRecording(sessionId: String, save: Boolean, message: String) {
+        recordingFinishMutex.withLock {
+            val currentId = activeRecordingSessionId() ?: return
+            if (currentId != sessionId || recordingState is RecordingState.Finalizing) return
+            recordingState = RecordingState.Finalizing(sessionId)
+            recordingView?.setArmed(false)
+            val session = recordingSession
+            val target = recordingTargetPackage
+            val display = recordingDisplay
+            val timeline = if (save) {
+                session?.finish() ?: MacroTimeline()
+            } else {
+                session?.cancel()
+                MacroTimeline()
+            }
+            cleanupRecordingWindows()
+
+            if (!save || timeline.segments.isEmpty() || target == null || display == null) {
+                recordingState = RecordingState.Idle
+                toast(if (save && timeline.segments.isEmpty()) "没有录到有效动作" else message)
+                refreshOverlays()
+                return
+            }
+            val now = System.currentTimeMillis()
+            val combo = Combo(
+                id = UUID.randomUUID().toString(),
+                name = "连招 ${SimpleDateFormat("HH:mm:ss", Locale.CHINA).format(Date(now))}",
+                targetPackage = target,
+                orientation = display.orientation,
+                recordedWidth = display.width,
+                recordedHeight = display.height,
+                timeline = timeline,
+                createdAt = now,
+                updatedAt = now,
+            )
+            val saveFailure = runCatching { comboRepository.save(combo) }.exceptionOrNull()
+            if (saveFailure != null) {
+                recordingState = RecordingState.Idle
+                toast("保存失败：${saveFailure.message ?: "本地数据库不可用"}")
+                refreshOverlays()
+                return
+            }
+            recordingState = RecordingState.Idle
+            toast(message)
+            refreshOverlays()
+            openComboEditor(combo)
+        }
+    }
+
+    private fun activeRecordingSessionId(): String? = when (val state = recordingState) {
+        is RecordingState.Countdown -> state.sessionId
+        is RecordingState.Capturing -> state.sessionId
+        is RecordingState.Finalizing -> state.sessionId
+        is RecordingState.Failed,
+        RecordingState.Idle,
+        -> null
     }
 
     private fun cleanupRecordingWindows() {
         recordingCountdownJob?.cancel()
         recordingTimeoutJob?.cancel()
+        recordingHudJob?.cancel()
         recordingCountdownJob = null
         recordingTimeoutJob = null
+        recordingHudJob = null
         removeView(recordingView)
-        removeView(recordingStopView)
+        removeView(recordingHudView)
         recordingView = null
         recordingParams = null
-        recordingStopView = null
-        recordingStopParams = null
+        recordingHudView = null
+        recordingHudParams = null
+        recordingHudStatus = null
         recordingSession = null
         recordingTargetPackage = null
         recordingDisplay = null
     }
 
-    private fun setRecordingWindowsTouchable(touchable: Boolean) {
-        updateTouchable(recordingView, recordingParams, touchable)
-        updateTouchable(recordingStopView, recordingStopParams, touchable)
-    }
-
     private fun openComboEditor(combo: Combo) {
-        if (recordingSession != null || playbackEngine.state.value is PlaybackState.Running) return
+        if (recordingState !is RecordingState.Idle ||
+            playbackEngine.state.value is PlaybackState.Running ||
+            overlayMode == OverlayMode.LAYOUT
+        ) return
         removePanel()
         removeEditor()
         val display = displaySnapshot()
@@ -607,11 +1141,7 @@ class ComboAccessibilityService : AccessibilityService() {
         var speed = combo.speed
         var intervalMs = combo.repeatIntervalMs
 
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(14), dp(16), dp(16))
-            background = roundedBackground(0xF22A2D3B.toInt(), 18f)
-        }
+        val content = panelContainer(horizontalPadding = 16, verticalPadding = 14)
         content.addView(panelTitle("编辑连招"))
         val nameInput = EditText(this).apply {
             setText(combo.name)
@@ -637,14 +1167,13 @@ class ComboAccessibilityService : AccessibilityService() {
             label.text = "执行倍速：${speed}×"
         }
 
-        val repeatLabel = panelHint("重复次数（1–999）")
+        content.addView(panelHint("重复次数（1–999）"))
         val repeatInput = EditText(this).apply {
             inputType = InputType.TYPE_CLASS_NUMBER
             setText(combo.repeatCount.toString())
             setTextColor(Color.WHITE)
             isSingleLine = true
         }
-        content.addView(repeatLabel)
         content.addView(repeatInput)
         addSeek(content, "重复间隔", 200, (intervalMs / 50L).toInt()) { value, label ->
             intervalMs = value * 50L
@@ -656,24 +1185,24 @@ class ComboAccessibilityService : AccessibilityService() {
             isChecked = combo.visible
         }
         content.addView(visible)
-        content.addView(panelHint("在游戏中直接拖动连招键可调整位置"))
-        content.addView(panelButton("保存") {
+        content.addView(panelHint("保存后会进入一次布局模式；完成摆放后统一锁定"))
+        content.addView(panelButton("保存并布局") {
             val repeatCount = repeatInput.text.toString().toIntOrNull()?.coerceIn(1, 999) ?: 1
+            val updated = combo.copy(
+                name = nameInput.text.toString(),
+                buttonSizeDp = sizeDp,
+                buttonOpacity = opacity,
+                speed = speed,
+                repeatCount = repeatCount,
+                repeatIntervalMs = intervalMs,
+                visible = visible.isChecked,
+                updatedAt = System.currentTimeMillis(),
+            )
             scope.launch {
-                comboRepository.save(
-                    combo.copy(
-                        name = nameInput.text.toString(),
-                        buttonSizeDp = sizeDp,
-                        buttonOpacity = opacity,
-                        speed = speed,
-                        repeatCount = repeatCount,
-                        repeatIntervalMs = intervalMs,
-                        visible = visible.isChecked,
-                        updatedAt = System.currentTimeMillis(),
-                    ),
-                )
+                comboRepository.save(updated)
                 removeEditor()
                 toast("连招设置已保存")
+                if (updated.visible) beginLayoutMode(updated) else refreshOverlays()
             }
         })
         content.addView(panelButton("取消") { removeEditor() })
@@ -703,7 +1232,8 @@ class ComboAccessibilityService : AccessibilityService() {
         val width = dp(326)
         val height = (display.height - dp(40)).coerceAtMost(dp(620))
         val params = overlayParams(width, height).apply {
-            flags = WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+            flags = WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_INSET_DECOR
             softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
             x = dp(20).coerceAtMost((display.width - width).coerceAtLeast(0))
             y = dp(20)
@@ -711,6 +1241,38 @@ class ComboAccessibilityService : AccessibilityService() {
         windowManager.addView(scroll, params)
         editorView = scroll
         nameInput.requestFocus()
+    }
+
+    private fun showDiagnostics() {
+        removePanel()
+        removeEditor()
+        val display = displaySnapshot()
+        val content = panelContainer()
+        content.addView(panelTitle("最近前台识别日志"))
+        val entries = debugDiagnostics?.snapshot().orEmpty().takeLast(200).asReversed()
+        content.addView(
+            panelHint(
+                if (entries.isEmpty()) {
+                    "暂无日志"
+                } else {
+                    entries.joinToString("\n\n") {
+                        "${it.recordedAtElapsedRealtimeMs}  ${it.kind}\n" +
+                            "${it.packageName.orEmpty()}  ${it.className.orEmpty()}\n" +
+                            "${it.previousState} → ${it.currentState}  ${it.decision}\n" +
+                            (it.display?.let { d -> "${d.width}×${d.height} ${d.orientation}" }.orEmpty())
+                    }
+                },
+            ),
+        )
+        content.addView(panelButton("关闭") { removeEditor() })
+        val scroll = ScrollView(this).apply { addView(content) }
+        val width = dp(344).coerceAtMost(display.width)
+        val params = overlayParams(width, (display.height - dp(40)).coerceAtLeast(dp(240))).apply {
+            x = dp(20).coerceAtMost((display.width - width).coerceAtLeast(0))
+            y = dp(20)
+        }
+        windowManager.addView(scroll, params)
+        editorView = scroll
     }
 
     private fun addSeek(
@@ -724,6 +1286,7 @@ class ComboAccessibilityService : AccessibilityService() {
         val seek = SeekBar(this).apply {
             this.max = max
             this.progress = progress.coerceIn(0, max)
+            minimumHeight = dp(48)
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(seekBar: SeekBar?, value: Int, fromUser: Boolean) {
                     onChanged(value, label)
@@ -746,6 +1309,48 @@ class ComboAccessibilityService : AccessibilityService() {
         )
     }
 
+    private fun foregroundSummary(): String {
+        val active = foregroundTracker.activePackageName
+        val candidate = foregroundTracker.candidatePackageName
+        val retained = foregroundTracker.confirmedPackageName
+        val packageLabel = active ?: candidate ?: retained ?: "未识别"
+        return "当前识别：$packageLabel\n状态：${hiddenReasonText(foregroundTracker.hiddenReason)}"
+    }
+
+    private fun hiddenReasonText(reason: HiddenReason): String = when (reason) {
+        HiddenReason.NONE -> "已确认，可执行"
+        HiddenReason.UNKNOWN_FOREGROUND -> "尚未识别前台应用"
+        HiddenReason.CANDIDATE_UNCONFIRMED -> "候选应用等待稳定或手动确认"
+        HiddenReason.TEMPORARY_SYSTEM_WINDOW -> "输入法或系统窗口暂时遮挡"
+        HiddenReason.OWN_APPLICATION -> "连招助手主界面在前台"
+        HiddenReason.DIFFERENT_APPLICATION -> "已进入其他应用"
+        HiddenReason.SCREEN_OFF -> "屏幕已关闭"
+        HiddenReason.SERVICE_DISCONNECTED -> "无障碍服务已断开"
+    }
+
+    private fun currentCombo(id: String): Combo? =
+        if (overlayMode == OverlayMode.LAYOUT) layoutSession?.combo(id)
+        else latestCombos.firstOrNull { it.id == id }
+
+    private fun stableDisplay(): DisplaySnapshot? =
+        (displayTracker.state as? DisplayState.Stable)?.snapshot
+
+    private fun scheduleDisplayStabilization() {
+        val token = displayTracker.markUnstable()
+        displayStabilizeJob?.cancel()
+        displayStabilizeJob = scope.launch {
+            delay(100L)
+            displayTracker.recordIntermediate(token, displaySnapshot())
+            refreshOverlays()
+            delay(200L)
+            if (!displayTracker.recordStable(token, displaySnapshot())) {
+                scheduleDisplayStabilization()
+                return@launch
+            }
+            refreshOverlays()
+        }
+    }
+
     private fun displaySnapshot(): DisplaySnapshot {
         val bounds = if (Build.VERSION.SDK_INT >= 30) {
             windowManager.currentWindowMetrics.bounds
@@ -762,6 +1367,36 @@ class ComboAccessibilityService : AccessibilityService() {
         )
     }
 
+    private fun DisplaySnapshot.toForegroundDisplayInfo(): ForegroundDisplayInfo =
+        ForegroundDisplayInfo(
+            width = width,
+            height = height,
+            orientation = when {
+                width == height -> ForegroundDisplayOrientation.SQUARE
+                width > height -> ForegroundDisplayOrientation.LANDSCAPE
+                else -> ForegroundDisplayOrientation.PORTRAIT
+            },
+        )
+
+    private fun currentInputMethodPackage(): String? = runCatching {
+        val flattened = Settings.Secure.getString(contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD)
+        ComponentName.unflattenFromString(flattened)?.packageName
+    }.getOrNull()
+
+    private fun classifyObservedPackage(value: String?): ForegroundPackageKind {
+        val normalized = value?.trim().orEmpty()
+        return when {
+            normalized.isEmpty() -> ForegroundPackageKind.INVALID
+            BuildConfig.DEBUG && debugTouchTestVisible && normalized == packageName ->
+                ForegroundPackageKind.EXTERNAL
+            normalized == packageName -> ForegroundPackageKind.OWN_APP
+            normalized == currentInputMethodPackage() -> ForegroundPackageKind.TRANSIENT
+            normalized in SetBasedForegroundPackageClassifier.DEFAULT_TRANSIENT_PACKAGES ->
+                ForegroundPackageKind.TRANSIENT
+            else -> ForegroundPackageKind.EXTERNAL
+        }
+    }
+
     private fun overlayParams(width: Int, height: Int): WindowManager.LayoutParams =
         WindowManager.LayoutParams(
             width,
@@ -772,42 +1407,24 @@ class ComboAccessibilityService : AccessibilityService() {
             PixelFormat.TRANSLUCENT,
         ).apply { gravity = Gravity.TOP or Gravity.START }
 
-    private inner class DragClickListener(
-        private val params: WindowManager.LayoutParams,
-        private val onClick: () -> Unit,
-        private val onPositionSaved: (Int, Int) -> Unit,
-    ) : View.OnTouchListener {
-        private var downX = 0f
-        private var downY = 0f
-        private var originX = 0
-        private var originY = 0
-        private var moved = false
-        private val slop = ViewConfiguration.get(this@ComboAccessibilityService).scaledTouchSlop
+    private fun panelParams(
+        width: Int,
+        display: DisplaySnapshot,
+        estimatedHeight: Int,
+    ): WindowManager.LayoutParams = overlayParams(width, WindowManager.LayoutParams.WRAP_CONTENT).apply {
+        val ball = ballParams
+        x = ((ball?.x ?: 0) + dp(58)).coerceAtMost((display.width - width).coerceAtLeast(0))
+        y = (ball?.y ?: dp(80)).coerceIn(0, (display.height - estimatedHeight).coerceAtLeast(0))
+    }
 
-        override fun onTouch(view: View, event: MotionEvent): Boolean {
-            val display = displaySnapshot()
-            when (event.actionMasked) {
-                MotionEvent.ACTION_DOWN -> {
-                    downX = event.rawX
-                    downY = event.rawY
-                    originX = params.x
-                    originY = params.y
-                    moved = false
-                }
-                MotionEvent.ACTION_MOVE -> {
-                    val dx = event.rawX - downX
-                    val dy = event.rawY - downY
-                    if (abs(dx) > slop || abs(dy) > slop) moved = true
-                    if (moved) {
-                        params.x = (originX + dx.toInt()).coerceIn(0, (display.width - view.width).coerceAtLeast(0))
-                        params.y = (originY + dy.toInt()).coerceIn(0, (display.height - view.height).coerceAtLeast(0))
-                        runCatching { windowManager.updateViewLayout(view, params) }
-                    }
-                }
-                MotionEvent.ACTION_UP -> if (moved) onPositionSaved(params.x, params.y) else onClick()
-            }
-            return true
-        }
+    private fun panelContainer(
+        horizontalPadding: Int = 12,
+        verticalPadding: Int = 12,
+    ): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(horizontalPadding), dp(verticalPadding), dp(horizontalPadding), dp(verticalPadding))
+        background = roundedBackground(0xF2292C3A.toInt(), 18f)
+        elevation = dp(10).toFloat()
     }
 
     private fun makePill(text: String, color: Int, textSizeSp: Float): TextView = TextView(this).apply {
@@ -817,6 +1434,8 @@ class ComboAccessibilityService : AccessibilityService() {
         gravity = Gravity.CENTER
         isClickable = true
         isFocusable = true
+        minimumWidth = dp(48)
+        minimumHeight = dp(48)
         background = roundedBackground(color, 16f)
     }
 
@@ -837,40 +1456,65 @@ class ComboAccessibilityService : AccessibilityService() {
     private fun panelButton(text: String, action: () -> Unit): Button = Button(this).apply {
         this.text = text
         isAllCaps = false
+        minHeight = dp(48)
         setTextColor(Color.WHITE)
         backgroundTintList = android.content.res.ColorStateList.valueOf(0xFF44495D.toInt())
         setOnClickListener { action() }
     }
 
-    private fun circleBackground(color: Int): GradientDrawable = GradientDrawable().apply {
+    private fun comboButtonBackground(): GradientDrawable =
+        GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(0xFF157BD6.toInt())
+            setStroke(dp(1), 0x66FFFFFF)
+        }
+
+    private fun layoutRingBackground(selected: Boolean): GradientDrawable =
+        GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(Color.TRANSPARENT)
+            setStroke(dp(3), if (selected) 0xFFFFCE57.toInt() else 0xFF58D7FF.toInt())
+        }
+
+    private fun ballBackground(): GradientDrawable = GradientDrawable().apply {
         shape = GradientDrawable.OVAL
-        setColor(color)
-        setStroke(dp(1), 0x66FFFFFF)
+        setColor(0xFF6D5CE7.toInt())
+        setStroke(
+            dp(if (overlayMode == OverlayMode.LAYOUT) 3 else 1),
+            if (overlayMode == OverlayMode.LAYOUT) 0xFFFFCE57.toInt() else 0x66FFFFFF,
+        )
     }
 
     private fun roundedBackground(color: Int, radiusDp: Float): GradientDrawable = GradientDrawable().apply {
         setColor(color)
-        cornerRadius = dp(radiusDp.toInt()).toFloat()
+        cornerRadius = dp(radiusDp).toFloat()
         setStroke(dp(1), 0x33FFFFFF)
     }
 
-    private fun updateTouchable(
-        view: View?,
-        params: WindowManager.LayoutParams?,
-        touchable: Boolean,
-    ) {
-        if (view == null || params == null) return
-        params.flags = if (touchable) {
-            params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
-        } else {
-            params.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+    private fun removeComboButton(id: String): Boolean {
+        val entry = comboButtons[id] ?: return true
+        if (!entry.root.isAttachedToWindow) {
+            comboButtons.remove(id, entry)
+            return true
         }
-        runCatching { windowManager.updateViewLayout(view, params) }
+        return runCatching {
+            windowManager.removeViewImmediate(entry.root)
+            comboButtons.remove(id, entry)
+            true
+        }.getOrElse {
+            // A failed removal of a still-attached view remains tracked and will be retried by the
+            // next reconciliation. If the platform detached it while throwing, cleanup is done.
+            if (!entry.root.isAttachedToWindow) {
+                comboButtons.remove(id, entry)
+                true
+            } else {
+                false
+            }
+        }
     }
 
-    private fun removeComboButtons() {
-        comboButtons.values.forEach { removeView(it.first) }
-        comboButtons.clear()
+    private fun clearComboButtons() {
+        overlayCoordinator.clear(onRemoved = ::removeComboButton)
     }
 
     private fun removePanel() {
@@ -900,15 +1544,7 @@ class ComboAccessibilityService : AccessibilityService() {
         runCatching { windowManager.removeViewImmediate(view) }
     }
 
-    private fun isExternalPackage(value: String): Boolean {
-        if (value == packageName || value == "android") return false
-        return value !in setOf(
-            "com.android.systemui",
-            "com.android.permissioncontroller",
-            "com.google.android.permissioncontroller",
-        )
-    }
-
     private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+    private fun dp(value: Float): Int = (value * resources.displayMetrics.density).toInt()
 }

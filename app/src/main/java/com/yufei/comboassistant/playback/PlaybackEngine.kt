@@ -5,11 +5,13 @@ import com.yufei.comboassistant.domain.DisplaySnapshot
 import com.yufei.comboassistant.domain.GestureSegment
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
 
 sealed interface PlaybackState {
@@ -26,31 +28,40 @@ interface GesturePerformer {
     fun cancelActive()
 }
 
+sealed interface ExecutionGateResult {
+    data class Allowed(val display: DisplaySnapshot) : ExecutionGateResult
+    data class Blocked(val reason: String) : ExecutionGateResult
+}
+
+fun interface ExecutionGate {
+    fun check(combo: Combo): ExecutionGateResult
+}
+
 class PlaybackEngine(
     private val scope: CoroutineScope,
     private val performer: GesturePerformer,
+    private val executionGate: ExecutionGate,
 ) {
     private val mutableState = MutableStateFlow<PlaybackState>(PlaybackState.Idle)
     val state: StateFlow<PlaybackState> = mutableState.asStateFlow()
 
     private var playbackJob: Job? = null
 
-    fun play(combo: Combo, display: DisplaySnapshot, currentPackage: String?): Boolean {
-        if (playbackJob?.isActive == true) return false
-        if (currentPackage != combo.targetPackage) {
-            mutableState.value = PlaybackState.Failed("当前应用与连招绑定游戏不一致")
-            return false
-        }
-        if (display.orientation != combo.orientation) {
-            mutableState.value = PlaybackState.Failed("屏幕方向与录制方向不一致")
-            return false
-        }
+    fun play(combo: Combo): Boolean {
+        // A cancelled job still owns the performer until its finally block runs. Keeping the
+        // identity here prevents stop() followed by an immediate play() from overlapping jobs.
+        if (playbackJob != null) return false
         if (combo.timeline.segments.isEmpty()) {
             mutableState.value = PlaybackState.Failed("连招没有可执行动作")
             return false
         }
+        val initialGate = executionGate.check(combo)
+        if (initialGate is ExecutionGateResult.Blocked) {
+            mutableState.value = PlaybackState.Failed(initialGate.reason)
+            return false
+        }
 
-        playbackJob = scope.launch {
+        val newJob = scope.launch(start = CoroutineStart.LAZY) {
             try {
                 repeat(combo.repeatCount) { repetitionIndex ->
                     mutableState.value = PlaybackState.Running(
@@ -60,6 +71,9 @@ class PlaybackEngine(
                     )
                     combo.timeline.segments.forEach { segment ->
                         delay(scaleDelay(segment.gapBeforeMs, combo.speed))
+                        val gate = executionGate.check(combo)
+                        if (gate is ExecutionGateResult.Blocked) error(gate.reason)
+                        val display = (gate as ExecutionGateResult.Allowed).display
                         when (performer.perform(segment, combo.speed, display)) {
                             GestureResult.COMPLETED -> Unit
                             GestureResult.CANCELLED -> error("手势被系统或用户操作取消")
@@ -76,18 +90,28 @@ class PlaybackEngine(
             } catch (error: Throwable) {
                 mutableState.value = PlaybackState.Failed(error.message ?: "回放失败")
             } finally {
-                playbackJob = null
+                if (playbackJob === coroutineContext.job) playbackJob = null
             }
         }
+        playbackJob = newJob
+        // A LAZY coroutine cancelled before its first dispatch never enters the body, so its
+        // finally block cannot release the slot. Defer that exceptional cleanup onto the owning
+        // scope; until it runs, an immediate replacement is still rejected.
+        newJob.invokeOnCompletion {
+            scope.launch {
+                if (playbackJob === newJob) playbackJob = null
+            }
+        }
+        newJob.start()
         return true
     }
 
     fun stop(reason: String) {
-        if (playbackJob?.isActive != true) return
+        val activeJob = playbackJob ?: return
+        if (activeJob.isCompleted) return
         mutableState.value = PlaybackState.Stopped(reason)
         performer.cancelActive()
-        playbackJob?.cancel()
-        playbackJob = null
+        activeJob.cancel()
     }
 
     companion object {

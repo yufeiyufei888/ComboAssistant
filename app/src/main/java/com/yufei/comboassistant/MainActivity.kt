@@ -1,8 +1,11 @@
 package com.yufei.comboassistant
 
 import android.accessibilityservice.AccessibilityServiceInfo
+import android.app.AppOpsManager
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.view.accessibility.AccessibilityManager
@@ -16,7 +19,9 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.sizeIn
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -53,6 +58,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -67,6 +74,7 @@ import kotlin.math.roundToInt
 class MainActivity : ComponentActivity() {
     private val viewModel: MainViewModel by viewModels()
     private val serviceEnabled = mutableStateOf(false)
+    private val usageAccessGranted = mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -76,18 +84,22 @@ class MainActivity : ComponentActivity() {
                 MainScreen(
                     state = state,
                     serviceEnabled = serviceEnabled.value,
+                    usageAccessGranted = usageAccessGranted.value,
                     onAcceptDisclosure = viewModel::setDisclosureAccepted,
                     onOpenAccessibility = {
                         startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
                     },
                     onSetFloatingBall = viewModel::setFloatingBallEnabled,
                     onSetButtonsHidden = viewModel::setButtonsHidden,
+                    onSetEnhancedForegroundDetection = viewModel::setEnhancedForegroundDetection,
+                    onOpenUsageAccess = ::openUsageAccessSettings,
                     onSaveCombo = viewModel::save,
                     onDeleteCombo = viewModel::delete,
                     onOpenTouchTest = {
                         startActivity(Intent(this, TouchTestActivity::class.java))
                     },
                     showDebugTools = BuildConfig.DEBUG,
+                    appVersion = BuildConfig.VERSION_NAME,
                 )
             }
         }
@@ -96,6 +108,13 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         serviceEnabled.value = isComboServiceEnabled(this)
+        usageAccessGranted.value = isUsageAccessGranted(this)
+    }
+
+    private fun openUsageAccessSettings() {
+        val targetedIntent = createUsageAccessSettingsIntent(this)
+        runCatching { startActivity(targetedIntent) }
+            .onFailure { startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)) }
     }
 }
 
@@ -107,19 +126,48 @@ fun isComboServiceEnabled(context: Context): Boolean {
     }
 }
 
+fun isUsageAccessGranted(context: Context): Boolean {
+    val appOps = context.getSystemService(AppOpsManager::class.java) ?: return false
+    val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        appOps.unsafeCheckOpNoThrow(
+            AppOpsManager.OPSTR_GET_USAGE_STATS,
+            context.applicationInfo.uid,
+            context.packageName,
+        )
+    } else {
+        @Suppress("DEPRECATION")
+        appOps.checkOpNoThrow(
+            AppOpsManager.OPSTR_GET_USAGE_STATS,
+            context.applicationInfo.uid,
+            context.packageName,
+        )
+    }
+    return mode == AppOpsManager.MODE_ALLOWED
+}
+
+fun createUsageAccessSettingsIntent(context: Context): Intent =
+    Intent(
+        Settings.ACTION_USAGE_ACCESS_SETTINGS,
+        Uri.parse("package:${context.packageName}"),
+    )
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen(
     state: MainUiState,
     serviceEnabled: Boolean,
+    usageAccessGranted: Boolean,
     onAcceptDisclosure: (Boolean) -> Unit,
     onOpenAccessibility: () -> Unit,
     onSetFloatingBall: (Boolean) -> Unit,
     onSetButtonsHidden: (Boolean) -> Unit,
+    onSetEnhancedForegroundDetection: (Boolean) -> Unit,
+    onOpenUsageAccess: () -> Unit,
     onSaveCombo: (Combo) -> Unit,
     onDeleteCombo: (String) -> Unit,
     onOpenTouchTest: () -> Unit,
     showDebugTools: Boolean,
+    appVersion: String,
 ) {
     var editingComboId by rememberSaveable { mutableStateOf<String?>(null) }
     var deletingComboId by rememberSaveable { mutableStateOf<String?>(null) }
@@ -162,8 +210,12 @@ fun MainScreen(
                     GlobalSettingsCard(
                         floatingBallEnabled = state.settings.floatingBallEnabled,
                         buttonsHidden = state.settings.buttonsHidden,
+                        enhancedForegroundDetection = state.settings.enhancedForegroundDetection,
+                        usageAccessGranted = usageAccessGranted,
                         onSetFloatingBall = onSetFloatingBall,
                         onSetButtonsHidden = onSetButtonsHidden,
+                        onSetEnhancedForegroundDetection = onSetEnhancedForegroundDetection,
+                        onOpenUsageAccess = onOpenUsageAccess,
                     )
                 }
             }
@@ -208,6 +260,14 @@ fun MainScreen(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error,
                     modifier = Modifier.padding(vertical = 8.dp),
+                )
+            }
+            item {
+                Text(
+                    "版本 $appVersion · 本地运行，无网络权限",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(bottom = 8.dp),
                 )
             }
         }
@@ -292,8 +352,9 @@ private fun UsageCard() {
         Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("使用方法", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
             Text("1. 开启“连招助手触控服务”，然后进入目标游戏。")
-            Text("2. 点击紫色“连”悬浮球 → 新建录制；每次抬手后动作才会镜像到游戏。")
-            Text("3. 点击独立连招键执行；拖动改位置，长按编辑大小、透明度、倍速和重复参数。")
+            Text("2. 点击紫色“连”悬浮球 → 新建录制；倒计时结束后可连续操作，也可在手势之间等待。")
+            Text("3. 录制期间触摸由透明录制层接收，游戏不会同步响应。点击“结束并保存”后统一生成连招，不会自动试播。")
+            Text("4. 在“布局按键”中解锁、拖动和调节按键；点击“完成并锁定”后，短按连招键执行。")
         }
     }
 }
@@ -302,27 +363,98 @@ private fun UsageCard() {
 private fun GlobalSettingsCard(
     floatingBallEnabled: Boolean,
     buttonsHidden: Boolean,
+    enhancedForegroundDetection: Boolean,
+    usageAccessGranted: Boolean,
     onSetFloatingBall: (Boolean) -> Unit,
     onSetButtonsHidden: (Boolean) -> Unit,
+    onSetEnhancedForegroundDetection: (Boolean) -> Unit,
+    onOpenUsageAccess: () -> Unit,
 ) {
     OutlinedCard(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             SettingSwitch("显示设置悬浮球", floatingBallEnabled, onSetFloatingBall)
             HorizontalDivider()
             SettingSwitch("暂时隐藏全部连招键", buttonsHidden, onSetButtonsHidden)
+            HorizontalDivider()
+            SettingSwitch(
+                label = "增强前台识别",
+                value = enhancedForegroundDetection,
+                onChanged = onSetEnhancedForegroundDetection,
+                supportingText = "约每秒只查询最近的前台应用包名；不保存使用历史，也不联网。未授权时自动退回无障碍事件识别。",
+                testTag = "enhanced_foreground_detection",
+            )
+            Surface(
+                color = if (usageAccessGranted) {
+                    MaterialTheme.colorScheme.primaryContainer
+                } else {
+                    MaterialTheme.colorScheme.errorContainer
+                },
+                contentColor = if (usageAccessGranted) {
+                    MaterialTheme.colorScheme.onPrimaryContainer
+                } else {
+                    MaterialTheme.colorScheme.onErrorContainer
+                },
+                shape = MaterialTheme.shapes.medium,
+            ) {
+                Text(
+                    text = if (usageAccessGranted) {
+                        "使用情况访问权限：已授权"
+                    } else {
+                        "使用情况访问权限：未授权"
+                    },
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    style = MaterialTheme.typography.labelLarge,
+                )
+            }
+            OutlinedButton(
+                onClick = onOpenUsageAccess,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp)
+                    .testTag("open_usage_access"),
+            ) {
+                Text(if (usageAccessGranted) "管理使用情况访问权限" else "前往授权使用情况访问权限")
+            }
         }
     }
 }
 
 @Composable
-private fun SettingSwitch(label: String, value: Boolean, onChanged: (Boolean) -> Unit) {
+private fun SettingSwitch(
+    label: String,
+    value: Boolean,
+    onChanged: (Boolean) -> Unit,
+    supportingText: String? = null,
+    testTag: String? = null,
+) {
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(label)
-        Switch(checked = value, onCheckedChange = onChanged)
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .padding(end = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text(label)
+            if (supportingText != null) {
+                Text(
+                    supportingText,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        val switchModifier = if (testTag != null) Modifier.testTag(testTag) else Modifier
+        Switch(
+            checked = value,
+            onCheckedChange = onChanged,
+            modifier = switchModifier
+                .sizeIn(minWidth = 48.dp, minHeight = 48.dp)
+                .semantics { contentDescription = label },
+        )
     }
 }
 
@@ -404,8 +536,12 @@ private fun ComboEditorDialog(combo: Combo, onDismiss: () -> Unit, onSave: (Comb
                     valueRange = 0f..10_000f,
                     steps = 199,
                 )
-                SettingSwitch("显示此连招按键", visible) { visible = it }
-                Text("按键位置请在游戏中直接拖动悬浮连招键。", style = MaterialTheme.typography.bodySmall)
+                SettingSwitch(
+                    label = "显示此连招按键",
+                    value = visible,
+                    onChanged = { visible = it },
+                )
+                Text("按键位置请在游戏中的“布局按键”模式解锁拖动，完成后会重新锁定。", style = MaterialTheme.typography.bodySmall)
             }
         },
         confirmButton = {

@@ -67,14 +67,18 @@ fun MainScreenPreviewScreenshotTest() {
                 settings = GlobalSettings(disclosureAccepted = true),
             ),
             serviceEnabled = true,
+            usageAccessGranted = true,
             onAcceptDisclosure = {},
             onOpenAccessibility = {},
             onSetFloatingBall = {},
             onSetButtonsHidden = {},
+            onSetEnhancedForegroundDetection = {},
+            onOpenUsageAccess = {},
             onSaveCombo = {},
             onDeleteCombo = {},
             onOpenTouchTest = {},
             showDebugTools = true,
+            appVersion = "0.2.0-beta.1-debug",
         )
     }
 }
