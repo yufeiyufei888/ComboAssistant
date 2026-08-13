@@ -55,7 +55,7 @@ JaCoCo HTML 报告在 `app/build/reports/jacoco/jacocoDebugReport/html/`；Compo
 
 - 每次 Pull Request 及 `main` 推送运行 JVM/Robolectric 测试、JaCoCo、Lint、Compose 截图验证、`androidTest` 编译和 Debug APK 构建。
 - 每次 Pull Request 及 `main` 推送在固定 API 35、Google APIs、Pixel 7 模拟器运行 `connectedDebugAndroidTest`。
-- API 26 兼容作业只在每周定时任务（UTC 周日 18:00，即北京时间周一 02:00）或手动 `workflow_dispatch` 时运行；手动触发同时会运行常规和 API 35 作业。
+- API 26 兼容作业只在每周定时任务（UTC 周日 18:00，即北京时间周一 02:00）或手动 `workflow_dispatch` 时运行；手动触发同时会运行常规和 API 35 作业。API 26 运行启动流程与 Room 测试；依赖固定 Pixel 7 像素基线的 Dropshots 仅在 API 35 运行。
 - CI 文件名为 `ComboAssistant-v0.2.0-beta.1-debug-ci.apk`，使用临时 CI 调试签名，不是侧载发布物。Pre-release 只上传从合并后 `main` 重新构建并用既有调试密钥签名的 `ComboAssistant-v0.2.0-beta.1-debug.apk` 与 `SHA256SUMS.txt`。
 
 ## 当前验证结果（v0.2.0-beta.1，2026-08-13）
