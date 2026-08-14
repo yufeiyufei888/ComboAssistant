@@ -19,14 +19,102 @@ interface UsageForegroundSource {
     ): ForegroundObservation?
 
     companion object {
-        const val DEFAULT_LOOKBACK_MS: Long = 15_000L
+        /** Subsequent polls only need a small overlap; the first poll reconstructs current state. */
+        const val DEFAULT_LOOKBACK_MS: Long = 60_000L
         const val MAX_LOOKBACK_MS: Long = 60_000L
+        const val INITIAL_RECONSTRUCTION_MS: Long = 24L * 60L * 60L * 1_000L
+    }
+}
+
+internal enum class UsageLifecycleTransition { FOREGROUND, BACKGROUND }
+
+internal data class UsageLifecycleRecord(
+    val packageName: String,
+    val className: String?,
+    val eventWallTimeMs: Long,
+    val transition: UsageLifecycleTransition,
+    val foregroundKind: ForegroundObservationKind,
+)
+
+internal data class UsageForegroundSnapshot(
+    val packageName: String,
+    val className: String?,
+    val stateEventWallTimeMs: Long,
+    val kind: ForegroundObservationKind,
+)
+
+internal fun shouldReconstructUsageQuery(
+    initialized: Boolean,
+    nowWallTimeMs: Long,
+    lastQueryEndWallTimeMs: Long,
+    incrementalLookbackMs: Long,
+): Boolean = !initialized ||
+    nowWallTimeMs < lastQueryEndWallTimeMs ||
+    nowWallTimeMs - lastQueryEndWallTimeMs > incrementalLookbackMs
+
+/**
+ * Rebuilds the currently resumed Activity set instead of mistaking the latest historical RESUMED
+ * row for the current application. More than one active package is deliberately ambiguous.
+ */
+internal class UsageForegroundReducer {
+    private data class ActivityKey(val packageName: String, val className: String?)
+
+    private val activeActivities = linkedMapOf<ActivityKey, UsageLifecycleRecord>()
+    private var lastLifecycleEventWallTimeMs = Long.MIN_VALUE
+
+    val isAmbiguous: Boolean
+        get() = activeActivities.values.mapTo(mutableSetOf()) { it.packageName }.size > 1
+
+    val latestEventWallTimeMs: Long?
+        get() = activeActivities.values.maxOfOrNull { it.eventWallTimeMs }
+
+    fun clear() {
+        activeActivities.clear()
+        lastLifecycleEventWallTimeMs = Long.MIN_VALUE
+    }
+
+    fun accept(record: UsageLifecycleRecord) {
+        val packageName = record.packageName.trim()
+        if (packageName.isEmpty()) return
+        lastLifecycleEventWallTimeMs = maxOf(lastLifecycleEventWallTimeMs, record.eventWallTimeMs)
+        val className = record.className?.trim()?.takeIf(String::isNotEmpty)
+        val key = ActivityKey(packageName, className)
+        when (record.transition) {
+            UsageLifecycleTransition.FOREGROUND -> {
+                // A class-less legacy event represents the whole package.
+                if (className == null) {
+                    activeActivities.keys.filter { it.packageName == packageName }
+                        .forEach(activeActivities::remove)
+                }
+                activeActivities[key] = record.copy(packageName = packageName, className = className)
+            }
+            UsageLifecycleTransition.BACKGROUND -> {
+                if (className == null) {
+                    activeActivities.keys.filter { it.packageName == packageName }
+                        .forEach(activeActivities::remove)
+                } else {
+                    activeActivities.remove(key)
+                }
+            }
+        }
+    }
+
+    fun snapshot(): UsageForegroundSnapshot? {
+        val packages = activeActivities.values.groupBy { it.packageName }
+        if (packages.size != 1) return null
+        val latest = packages.values.single().maxByOrNull { it.eventWallTimeMs } ?: return null
+        return UsageForegroundSnapshot(
+            packageName = latest.packageName,
+            className = latest.className,
+            stateEventWallTimeMs = maxOf(latest.eventWallTimeMs, lastLifecycleEventWallTimeMs),
+            kind = latest.foregroundKind,
+        )
     }
 }
 
 /**
- * Queries only a recent UsageEvents window and retains only ACTIVITY_RESUMED or the legacy
- * MOVE_TO_FOREGROUND event. Results are never persisted.
+ * Reconstructs Activity lifecycle state on the first query, then incrementally updates it. Results
+ * are kept only in memory and contain no window text, usage duration, or account data.
  */
 class AndroidUsageForegroundSource(
     context: Context,
@@ -38,6 +126,9 @@ class AndroidUsageForegroundSource(
     private val usageStatsManager =
         appContext.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
     private val appOpsManager = appContext.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+    private val reducer = UsageForegroundReducer()
+    private var queryInitialized = false
+    private var lastQueryEndWallTimeMs = Long.MIN_VALUE
 
     override fun hasUsageAccess(): Boolean = runCatching {
         appOpsManager.checkOpNoThrow(
@@ -50,63 +141,124 @@ class AndroidUsageForegroundSource(
     override suspend fun latestForegroundObservation(
         lookbackMs: Long,
     ): ForegroundObservation? = withContext(dispatcher) {
-        if (!hasUsageAccess()) return@withContext null
+        if (!hasUsageAccess()) {
+            resetQueryState()
+            return@withContext null
+        }
 
-        val boundedLookback = lookbackMs.coerceIn(1L, UsageForegroundSource.MAX_LOOKBACK_MS)
         val nowWallMs = wallClockMs()
-        val startWallMs = nowWallMs - boundedLookback
+        val nowElapsedMs = elapsedRealtimeMs()
+        val boundedIncrementalLookback = lookbackMs.coerceIn(1L, UsageForegroundSource.MAX_LOOKBACK_MS)
+        val reconstruct = shouldReconstructUsageQuery(
+            initialized = queryInitialized,
+            nowWallTimeMs = nowWallMs,
+            lastQueryEndWallTimeMs = lastQueryEndWallTimeMs,
+            incrementalLookbackMs = boundedIncrementalLookback,
+        )
+        val startWallMs = if (reconstruct) {
+            reducer.clear()
+            val availableThisBoot = nowElapsedMs.coerceIn(1L, UsageForegroundSource.INITIAL_RECONSTRUCTION_MS)
+            nowWallMs - availableThisBoot
+        } else {
+            maxOf(
+                nowWallMs - boundedIncrementalLookback,
+                lastQueryEndWallTimeMs - QUERY_OVERLAP_MS,
+            )
+        }
         val events = runCatching {
             usageStatsManager.queryEvents(startWallMs, nowWallMs)
         }.getOrNull() ?: return@withContext null
 
         val event = UsageEvents.Event()
-        var latestPackage: String? = null
-        var latestClass: String? = null
-        var latestKind: ForegroundObservationKind? = null
-        var latestWallTimeMs = Long.MIN_VALUE
-
         while (events.hasNextEvent()) {
             events.getNextEvent(event)
-            val kind = event.toSupportedForegroundKind() ?: continue
-            val packageName = event.packageName?.trim().orEmpty()
-            if (packageName.isEmpty()) continue
-            if (event.timeStamp !in startWallMs..nowWallMs || event.timeStamp < latestWallTimeMs) continue
-
-            latestPackage = packageName
-            latestClass = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) event.className else null
-            latestKind = kind
-            latestWallTimeMs = event.timeStamp
+            if (event.timeStamp !in startWallMs..nowWallMs) continue
+            event.toLifecycleRecord()?.let(reducer::accept)
         }
+        queryInitialized = true
+        lastQueryEndWallTimeMs = nowWallMs
 
-        val packageName = latestPackage ?: return@withContext null
+        val snapshot = reducer.snapshot()
+        if (snapshot == null && !reducer.isAmbiguous) return@withContext null
         ForegroundObservation(
-            packageName = packageName,
-            className = latestClass,
+            packageName = snapshot?.packageName ?: AMBIGUOUS_TRANSIENT_PACKAGE,
+            className = snapshot?.className,
             source = ForegroundObservationSource.USAGE_STATS,
-            kind = latestKind ?: return@withContext null,
-            // Preserve the event's actual age in the monotonic clock domain. Stamping a stale
-            // UsageEvents row with query time could overrule a newer accessibility observation.
-            observedAtElapsedRealtimeMs = eventElapsedRealtimeMs(
-                nowElapsedRealtimeMs = elapsedRealtimeMs(),
+            kind = snapshot?.kind ?: ForegroundObservationKind.ACTIVITY_RESUMED,
+            // This is a current-state sample. Keep the historical lifecycle time separately for
+            // diagnostics and the screen-off boundary, but use sample time for cross-source order.
+            observedAtElapsedRealtimeMs = nowElapsedMs,
+            receivedAtElapsedRealtimeMs = nowElapsedMs,
+            sourceEventAtElapsedRealtimeMs = eventElapsedRealtimeMs(
+                nowElapsedRealtimeMs = nowElapsedMs,
                 nowWallTimeMs = nowWallMs,
-                eventWallTimeMs = latestWallTimeMs,
-                maxAgeMs = boundedLookback,
+                eventWallTimeMs = snapshot?.stateEventWallTimeMs
+                    ?: reducer.latestEventWallTimeMs
+                    ?: nowWallMs,
+                maxAgeMs = UsageForegroundSource.INITIAL_RECONSTRUCTION_MS,
             ),
-            sourceEventWallTimeMs = latestWallTimeMs,
+            sourceEventWallTimeMs = snapshot?.stateEventWallTimeMs
+                ?: reducer.latestEventWallTimeMs,
         )
     }
 
-    @Suppress("DEPRECATION")
-    private fun UsageEvents.Event.toSupportedForegroundKind(): ForegroundObservationKind? = when {
-        Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
-            eventType == UsageEvents.Event.ACTIVITY_RESUMED ->
-            ForegroundObservationKind.ACTIVITY_RESUMED
-        eventType == UsageEvents.Event.MOVE_TO_FOREGROUND ->
-            ForegroundObservationKind.MOVE_TO_FOREGROUND
-        else -> null
+    private fun resetQueryState() {
+        reducer.clear()
+        queryInitialized = false
+        lastQueryEndWallTimeMs = Long.MIN_VALUE
     }
 
-    companion object {
+    @Suppress("DEPRECATION")
+    private fun UsageEvents.Event.toLifecycleRecord(): UsageLifecycleRecord? {
+        val packageName = packageName?.toString()?.trim().orEmpty()
+        if (packageName.isEmpty()) return null
+        val className = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            className?.toString()
+        } else {
+            null
+        }
+        val transition: UsageLifecycleTransition
+        val foregroundKind: ForegroundObservationKind
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            when (eventType) {
+                UsageEvents.Event.ACTIVITY_RESUMED -> {
+                    transition = UsageLifecycleTransition.FOREGROUND
+                    foregroundKind = ForegroundObservationKind.ACTIVITY_RESUMED
+                }
+                UsageEvents.Event.ACTIVITY_PAUSED,
+                UsageEvents.Event.ACTIVITY_STOPPED,
+                -> {
+                    transition = UsageLifecycleTransition.BACKGROUND
+                    foregroundKind = ForegroundObservationKind.ACTIVITY_RESUMED
+                }
+                else -> return null
+            }
+        } else {
+            when (eventType) {
+                UsageEvents.Event.MOVE_TO_FOREGROUND -> {
+                    transition = UsageLifecycleTransition.FOREGROUND
+                    foregroundKind = ForegroundObservationKind.MOVE_TO_FOREGROUND
+                }
+                UsageEvents.Event.MOVE_TO_BACKGROUND -> {
+                    transition = UsageLifecycleTransition.BACKGROUND
+                    foregroundKind = ForegroundObservationKind.MOVE_TO_FOREGROUND
+                }
+                else -> return null
+            }
+        }
+        return UsageLifecycleRecord(
+            packageName = packageName,
+            className = className,
+            eventWallTimeMs = timeStamp,
+            transition = transition,
+            foregroundKind = foregroundKind,
+        )
+    }
+
+    private companion object {
+        const val QUERY_OVERLAP_MS = 2_000L
+        const val AMBIGUOUS_TRANSIENT_PACKAGE = "android"
+
         internal fun eventElapsedRealtimeMs(
             nowElapsedRealtimeMs: Long,
             nowWallTimeMs: Long,

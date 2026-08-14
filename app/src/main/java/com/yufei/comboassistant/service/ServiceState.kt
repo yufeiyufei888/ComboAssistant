@@ -22,6 +22,73 @@ sealed interface RecordingState {
     data class Failed(val reason: String) : RecordingState
 }
 
+internal sealed interface BallDragResult {
+    data object None : BallDragResult
+    data object Click : BallDragResult
+    data class Position(val x: Int, val y: Int) : BallDragResult
+}
+
+/** Pure gesture bookkeeping shared by locked and layout-mode floating-ball dragging. */
+internal class BallDragState(private val touchSlopPx: Int) {
+    private var active = false
+    private var moved = false
+    private var downRawX = 0f
+    private var downRawY = 0f
+    private var originX = 0
+    private var originY = 0
+
+    fun begin(rawX: Float, rawY: Float, x: Int, y: Int) {
+        active = true
+        moved = false
+        downRawX = rawX
+        downRawY = rawY
+        originX = x
+        originY = y
+    }
+
+    fun move(rawX: Float, rawY: Float, maxX: Int, maxY: Int): BallDragResult {
+        if (!active) return BallDragResult.None
+        val dx = rawX - downRawX
+        val dy = rawY - downRawY
+        if (kotlin.math.abs(dx) > touchSlopPx || kotlin.math.abs(dy) > touchSlopPx) moved = true
+        if (!moved) return BallDragResult.None
+        return BallDragResult.Position(
+            x = (originX + dx.toInt()).coerceIn(0, maxX.coerceAtLeast(0)),
+            y = (originY + dy.toInt()).coerceIn(0, maxY.coerceAtLeast(0)),
+        )
+    }
+
+    fun finish(currentX: Int, currentY: Int): BallDragResult {
+        if (!active) return BallDragResult.None
+        active = false
+        return if (moved) BallDragResult.Position(currentX, currentY) else BallDragResult.Click
+    }
+
+    fun cancel(): BallDragResult {
+        if (!active) return BallDragResult.None
+        active = false
+        return BallDragResult.Position(originX, originY)
+    }
+}
+
+internal fun panelHeightPx(
+    displayHeightPx: Int,
+    desiredHeightPx: Int,
+    landscape: Boolean,
+): Int {
+    val safeDisplay = displayHeightPx.coerceAtLeast(1)
+    val maxHeight = if (landscape) safeDisplay / 2 else (safeDisplay * 3) / 4
+    return desiredHeightPx.coerceIn(1, maxHeight.coerceAtLeast(1))
+}
+
+/** Logical user intent is authoritative; a stale/pending physical view never reopens a panel. */
+internal fun shouldRenderPanel(requestedOpen: Boolean, attached: Boolean): Boolean =
+    requestedOpen && !attached
+
+/** Layout selection may redraw an open panel, but never changes an explicit closed intent. */
+internal fun shouldRedrawLayoutPanel(requestedOpen: Boolean, selectionChanged: Boolean): Boolean =
+    requestedOpen && selectionChanged
+
 /** Keeps a layout save single-flight and rejects stale completion callbacks. */
 internal class LayoutCommitGuard {
     private var activeSessionId: String? = null

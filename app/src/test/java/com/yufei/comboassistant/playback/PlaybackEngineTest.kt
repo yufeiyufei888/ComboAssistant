@@ -99,6 +99,20 @@ class PlaybackEngineTest {
     }
 
     @Test
+    fun rejectedCancelRequestWarnsThatCurrentGestureMayFinish() = runTest {
+        val performer = CountingPerformer(cancelResult = CancelRequestResult.REJECTED)
+        val engine = PlaybackEngine(this, performer, allowedGate())
+        val combo = testCombo(repeatCount = 999, repeatIntervalMs = 10_000L)
+
+        assertTrue(engine.play(combo))
+        engine.stop("用户停止")
+
+        val stopped = engine.state.value as PlaybackState.Stopped
+        assertTrue(stopped.reason.contains("后续动作已停止"))
+        assertTrue(stopped.reason.contains("本段可能继续"))
+    }
+
+    @Test
     fun stopRejectsReplacementUntilCancelledJobFinishesCleanup() = runTest {
         val performer = SuspendingPerformer()
         val engine = PlaybackEngine(this, performer, allowedGate())
@@ -137,6 +151,7 @@ class PlaybackEngineTest {
 
     private class CountingPerformer(
         private val result: GestureResult = GestureResult.COMPLETED,
+        private val cancelResult: CancelRequestResult = CancelRequestResult.ACCEPTED,
     ) : GesturePerformer {
         var count: Int = 0
         var cancelCount: Int = 0
@@ -149,8 +164,9 @@ class PlaybackEngineTest {
             return result
         }
 
-        override fun cancelActive() {
+        override fun cancelActive(): CancelRequestResult {
             cancelCount += 1
+            return cancelResult
         }
     }
 
@@ -161,6 +177,6 @@ class PlaybackEngineTest {
             display: DisplaySnapshot,
         ): GestureResult = awaitCancellation()
 
-        override fun cancelActive() = Unit
+        override fun cancelActive(): CancelRequestResult = CancelRequestResult.ACCEPTED
     }
 }

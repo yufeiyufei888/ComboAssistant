@@ -56,19 +56,20 @@ JaCoCo HTML 报告在 `app/build/reports/jacoco/jacocoDebugReport/html/`；Compo
 - 每次 Pull Request 及 `main` 推送运行 JVM/Robolectric 测试、JaCoCo、Lint、Compose 截图验证、`androidTest` 编译和 Debug APK 构建。
 - 每次 Pull Request 及 `main` 推送在固定 API 35、Google APIs、Pixel 7 模拟器运行 `connectedDebugAndroidTest`。
 - API 26 兼容作业只在每周定时任务（UTC 周日 18:00，即北京时间周一 02:00）或手动 `workflow_dispatch` 时运行；手动触发同时会运行常规和 API 35 作业。API 26 运行启动流程与 Room 测试；依赖固定 Pixel 7 像素基线的 Dropshots 仅在 API 35 运行。
-- CI 文件名为 `ComboAssistant-v0.2.0-beta.1-debug-ci.apk`，使用临时 CI 调试签名，不是侧载发布物。Pre-release 只上传从合并后 `main` 重新构建并用既有调试密钥签名的 `ComboAssistant-v0.2.0-beta.1-debug.apk` 与 `SHA256SUMS.txt`。
+- CI 文件名为 `ComboAssistant-v0.2.0-beta.2-debug-ci.apk`，使用临时 CI 调试签名，不是侧载发布物。Pre-release 只上传从合并后 `main` 重新构建并用既有调试密钥签名的 `ComboAssistant-v0.2.0-beta.2-debug.apk` 与 `SHA256SUMS.txt`。
 
-## 当前验证结果（v0.2.0-beta.1，2026-08-13）
+## 当前验证结果（v0.2.0-beta.2，2026-08-14）
 
-- `testDebugUnitTest`：63 项通过，0 失败、0 跳过。新增覆盖前台状态机、连续离线录制、真实等待、Usage 事件年龄、方向稳定复测、事务式布局、悬浮窗失败恢复及回放停止竞态。
-- `validateDebugScreenshotTest`：九张 Compose 预览基线更新并验证通过。
+- `testDebugUnitTest`：80 项通过，0 失败、0 跳过。新增覆盖 HyperOS 截图/系统插件排除、单条内容杂讯、Usage 生命周期冷启动重建、候选稳定计时、面板关闭意图、横屏半高上限、设置球点击/拖动/取消及停止请求失败提示；原有连续录制、回放、Room 与 DataStore 测试继续通过。
+- `updateDebugScreenshotTest` 与 `validateDebugScreenshotTest`：九张 Compose 预览基线已更新为 beta.2 版本文字并复验通过。
 - `compileDebugAndroidTestKotlin`：Hilt、Room、UI Automator 与 Dropshots 仪器测试源码编译通过。
-- `jacocoDebugReport`：XML 与 HTML 覆盖率报告生成成功。
-- `lintDebug`：执行成功，0 error、27 个非阻断 warning；主要是依赖版本建议、程序化自定义 View 的 XML 构造器/无障碍提示和悬浮层动态中文文案提示。
-- `assembleDebug` 与 `apksigner verify`：通过；包名 `com.yufei.comboassistant`、`versionCode=2`、`versionName=0.2.0-beta.1-debug`。发布 APK 显式使用既有本机调试密钥重新签名，证书 SHA-256 为 `b952979d47d4437b7bf694ab52b9f9165331ead74eaf9a780e7b32f550fe7d9c`。
-- `connectedDebugAndroidTest`：固定 API 35、Google APIs、Pixel 7 模拟器共 3 项通过（UI Automator、Room 内存数据库、Dropshots），0 失败；Redmi K80 Pro 真机清单仍待逐项验收。
+- `jacocoDebugReport`：最新 80 项测试执行后 XML 与 HTML 覆盖率报告生成成功；Windows 沙箱无法写 Java Preferences 注册表，只产生非阻断警告。
+- `lintDebug`：执行成功，0 error、27 个非阻断 warning、4 个 information；主要是依赖版本建议、程序化自定义 View 的 XML 构造器/无障碍提示和悬浮层动态中文文案提示。
+- `assembleDebug` 与发布前签名核验：通过；包名 `com.yufei.comboassistant`、`versionCode=3`、`versionName=0.2.0-beta.2-debug`。最终发布物必须从合并后的 `main` 重建并使用 beta.1 的同一本机调试密钥重新签名；证书 SHA-256 必须为 `b952979d47d4437b7bf694ab52b9f9165331ead74eaf9a780e7b32f550fe7d9c`，最终 APK 哈希以 Release 附带的 `SHA256SUMS.txt` 为准。
+- `connectedDebugAndroidTest`：本次 beta.2 尚未重跑。beta.1 曾在固定 API 35、Google APIs、Pixel 7 模拟器通过 3 项（UI Automator、Room 内存数据库、Dropshots），该历史结果不能替代新候选的运行验证。
+- Redmi K80 Pro/澎湃OS：用户已实测确认基本连续录制、保存与回放可用。该结论不覆盖多指精度、全部倍速、999 次重复、覆盖安装或所有中止场景；游戏内偶发误识别为 `com.miui.securitycenter`、紧急停止按钮遮挡较大且不可调、划掉后台后可能需要重新启用无障碍服务，均留待下一版。
 
-最终源码由本地重跑和 [Pull Request #4](https://github.com/yufeiyufei888/ComboAssistant/pull/4) CI 确认；固定 API 35 模拟器结果以该 PR 的最新 GitHub Actions 记录为准。自动化全绿仍不等同于澎湃OS或真实游戏验收。
+beta.2 同时具备本地自动化证据和 Redmi K80 Pro 基础功能实测证据；两者的覆盖范围不同。GitHub CI 与固定 API 35 模拟器结果以本次发布 PR 为准，自动化全绿不能替代尚未完成的真机专项验收。
 
 ## 覆盖范围
 
@@ -80,45 +81,48 @@ JaCoCo HTML 报告在 `app/build/reports/jacoco/jacocoDebugReport/html/`；Compo
 
 ## Beta 发布核验
 
-从合并后的 `main` 重新构建后，先将最终侧载 APK 命名为 `ComboAssistant-v0.2.0-beta.1-debug.apk`，再执行以下核验；不要发布 CI 临时签名产物。
+从合并后的 `main` 重新构建后，先将最终侧载 APK 命名为 `ComboAssistant-v0.2.0-beta.2-debug.apk`，再执行以下核验；不要发布 CI 临时签名产物。
 
 ```powershell
 # 版本与包名（将 <SDK> 替换为 Android SDK 路径）
-& '<SDK>\build-tools\36.0.0\aapt2.exe' dump badging .\ComboAssistant-v0.2.0-beta.1-debug.apk
+& '<SDK>\build-tools\36.0.0\aapt2.exe' dump badging .\ComboAssistant-v0.2.0-beta.2-debug.apk
 
 # 合并后的 APK 权限清单
-& '<SDK>\build-tools\36.0.0\aapt2.exe' dump permissions .\ComboAssistant-v0.2.0-beta.1-debug.apk
+& '<SDK>\build-tools\36.0.0\aapt2.exe' dump permissions .\ComboAssistant-v0.2.0-beta.2-debug.apk
 
 # 签名证书
-& '<SDK>\build-tools\36.0.0\apksigner.bat' verify --verbose --print-certs .\ComboAssistant-v0.2.0-beta.1-debug.apk
+& '<SDK>\build-tools\36.0.0\apksigner.bat' verify --verbose --print-certs .\ComboAssistant-v0.2.0-beta.2-debug.apk
 
 # 发布哈希
-Get-FileHash .\ComboAssistant-v0.2.0-beta.1-debug.apk -Algorithm SHA256
+Get-FileHash .\ComboAssistant-v0.2.0-beta.2-debug.apk -Algorithm SHA256
 ```
 
-核验结果必须为：包名 `com.yufei.comboassistant`、`versionCode=2`、`versionName=0.2.0-beta.1-debug`、签名证书 SHA-256 `b952979d47d4437b7bf694ab52b9f9165331ead74eaf9a780e7b32f550fe7d9c`。合并清单只允许可选 `PACKAGE_USAGE_STATS` 及构建工具自动生成的应用内部权限，不得包含 `INTERNET`、`QUERY_ALL_PACKAGES` 或 `SYSTEM_ALERT_WINDOW`。将 APK 的 SHA-256 写入同目录 `SHA256SUMS.txt` 后一并上传 Pre-release。
+核验结果必须为：包名 `com.yufei.comboassistant`、`versionCode=3`、`versionName=0.2.0-beta.2-debug`、签名证书 SHA-256 `b952979d47d4437b7bf694ab52b9f9165331ead74eaf9a780e7b32f550fe7d9c`。合并清单只允许可选 `PACKAGE_USAGE_STATS` 及构建工具自动生成的应用内部权限，不得包含 `INTERNET`、`QUERY_ALL_PACKAGES` 或 `SYSTEM_ALERT_WINDOW`。将 APK 的 SHA-256 写入同目录 `SHA256SUMS.txt` 后一并上传 Pre-release。
 
 ## Redmi K80 Pro 实机清单
 
 建议测试前关闭自动旋转以外的手势增强、保持屏幕常亮，并使用不涉及账号资产的测试游戏/测试页面。
 
-- [ ] `adb install -r ComboAssistant-v0.2.0-beta.1-debug.apk` 覆盖安装成功，应用版本显示为 `0.2.0-beta.1-debug`。
+- [x] Redmi K80 Pro/澎湃OS 已确认可以完成基本连续录制、保存，并通过连招键正常回放（用户实测，2026-08-14；不代表以下专项均通过）。
+- [ ] `adb install -r ComboAssistant-v0.2.0-beta.2-debug.apk` 覆盖安装成功且不删除旧数据，应用版本显示为 `0.2.0-beta.2-debug`。
 - [ ] 首次未勾选用途说明时，前往无障碍设置按钮不可用；勾选后可进入系统设置。
 - [ ] 澎湃OS允许开启服务，紫色设置球出现；应用未申请普通悬浮窗权限。
-- [ ] 实况足球登录页→加载页→开局→启动页往返时，同包连招键自动恢复；输入法、通知栏只暂时隐藏。
+- [ ] 实况足球启动页排除 `com.miui.screenshot`、`miui.systemui.plugin`、`com.miui.systemui.plugin` 和 `com.miui.securitycenter` 误识别；登录页→加载页→开局→启动页往返时识别不横跳，同包连招键自动恢复。当前已知 `com.miui.securitycenter` 偶发失败。
+- [ ] 横屏黑色面板高度约为屏幕一半，内容可滚动；顶部“×”和再次点击紫色设置球都能立即关闭，连续展开/收起 20 次不复活旧面板。
 - [ ] 设置面板显示当前识别包名和隐藏原因；候选状态可手动确认为本次会话游戏，熄屏、服务重启或真实跨应用后该临时确认失效。
 - [ ] 拒绝或关闭“使用情况访问”后无障碍事件识别仍可工作；授权后冷启动恢复与约每秒低频校验生效，应用不保存使用历史。
 - [ ] 横屏目标中完成 3 秒倒计时，连续录制点击、长按、滑动、双指及中间等待；录制期间游戏明确不响应，结束后不自动试播。
 - [ ] 保存命名后自动进入布局模式；拖动多个连招键与设置球，调整大小/透明度，“完成并锁定”持久化，“取消”恢复工作副本。
-- [ ] 正常模式中的设置球与连招键均固定；滑动不移动、不执行，短按执行、长按编辑。
+- [ ] 正常模式中的紫色设置球可拖动且松手保存，重连服务后位置恢复；拖动不误开面板。连招键仍固定，滑动不移动、不执行，短按执行、长按编辑。
 - [ ] 36dp/96dp 视觉大小、至少 48dp 实际触控区、20%/100% 透明度、单独隐藏和全部隐藏均生效。
 - [ ] 0.25× 与 4× 的动作时长和动作间延时同步缩放，重复间隔不随倍速缩放。
-- [ ] 1 次重复完整结束；999 次只启动若干轮，然后点击红色停止按钮验证安全停止。
+- [ ] 1 次重复完整结束；999 次只启动若干轮，然后点击红色停止按钮验证安全停止。按钮当前固定在右上角且遮挡较大，位置/大小自定义留待下一版。
 - [ ] 回放时启动第二条连招被拒绝；目标应用拒绝注入时明确提示不兼容/执行失败。
 - [ ] 回放中切换应用、旋转、熄屏、关闭服务或用户手势取消时自动终止。
 - [ ] 录制达到 60 秒或 200 段自动保存已有已完成手势；取消、ACTION_CANCEL、旋转或真实跨应用不保存。
 - [ ] 点击“结束并保存”时尚未抬起的手势被丢弃；最后一次抬手到点击结束的尾部等待不写入时间轴。
 - [ ] 覆盖安装 v0.1 后旧连招、坐标和 DataStore 设置仍存在；签名证书指纹保持一致。
 - [ ] 重启应用和无障碍服务后，Room 连招与 DataStore 悬浮状态恢复。
+- [ ] 划掉应用后台并再次打开后核对系统无障碍服务状态；若澎湃OS停止/撤销服务，记录自启动与电池策略。普通应用不能强制保留系统授权。
 
 记录设备型号、澎湃OS版本、Android 版本、游戏包名/版本、方向、分辨率、每项结果与失败录像。游戏是否真正响应不能从 `dispatchGesture()` 成功回调单独推断。

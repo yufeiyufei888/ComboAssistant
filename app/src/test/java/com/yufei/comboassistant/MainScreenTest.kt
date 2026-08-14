@@ -45,7 +45,7 @@ class MainScreenTest {
                     onDeleteCombo = {},
                     onOpenTouchTest = {},
                     showDebugTools = false,
-                    appVersion = "0.2.0-beta.1-debug",
+                    appVersion = "0.2.0-beta.2-debug",
                 )
             }
         }
@@ -76,7 +76,7 @@ class MainScreenTest {
                     onDeleteCombo = {},
                     onOpenTouchTest = {},
                     showDebugTools = true,
-                    appVersion = "0.2.0-beta.1-debug",
+                    appVersion = "0.2.0-beta.2-debug",
                 )
             }
         }
@@ -113,7 +113,7 @@ class MainScreenTest {
                     onDeleteCombo = {},
                     onOpenTouchTest = {},
                     showDebugTools = false,
-                    appVersion = "0.2.0-beta.1-debug",
+                    appVersion = "0.2.0-beta.2-debug",
                 )
             }
         }
@@ -144,7 +144,7 @@ class MainScreenTest {
                     onDeleteCombo = {},
                     onOpenTouchTest = {},
                     showDebugTools = false,
-                    appVersion = "0.2.0-beta.1-debug",
+                    appVersion = "0.2.0-beta.2-debug",
                 )
             }
         }
