@@ -48,13 +48,13 @@ jobs:
             --stacktrace
 
       - name: Name CI debug APK
-        run: cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/ComboAssistant-v0.2.0-beta.1-debug-ci.apk
+        run: cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/ComboAssistant-v0.2.0-beta.2-debug-ci.apk
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: ComboAssistant-v0.2.0-beta.1-debug-ci
-          path: app/build/outputs/apk/debug/ComboAssistant-v0.2.0-beta.1-debug-ci.apk
+          name: ComboAssistant-v0.2.0-beta.2-debug-ci
+          path: app/build/outputs/apk/debug/ComboAssistant-v0.2.0-beta.2-debug-ci.apk
 
       - name: Upload verification reports
         if: always()

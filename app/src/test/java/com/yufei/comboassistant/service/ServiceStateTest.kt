@@ -4,6 +4,7 @@ import com.yufei.comboassistant.foreground.ConfirmedForegroundPackage
 import com.yufei.comboassistant.foreground.ForegroundConfirmationMethod
 import com.yufei.comboassistant.foreground.ForegroundSessionState
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -121,5 +122,43 @@ class ServiceStateTest {
         )
         assertTrue(mainActivity.shouldProcess)
         assertFalse(mainActivity.debugTouchTestVisible)
+    }
+
+    @Test
+    fun `ball drag distinguishes click commit and cancel rollback`() {
+        val drag = BallDragState(touchSlopPx = 8)
+        drag.begin(rawX = 100f, rawY = 100f, x = 20, y = 30)
+        assertEquals(BallDragResult.None, drag.move(105f, 104f, maxX = 300, maxY = 200))
+        assertEquals(BallDragResult.Click, drag.finish(currentX = 20, currentY = 30))
+
+        drag.begin(rawX = 100f, rawY = 100f, x = 20, y = 30)
+        assertEquals(
+            BallDragResult.Position(70, 90),
+            drag.move(150f, 160f, maxX = 300, maxY = 200),
+        )
+        assertEquals(BallDragResult.Position(70, 90), drag.finish(currentX = 70, currentY = 90))
+
+        drag.begin(rawX = 150f, rawY = 160f, x = 70, y = 90)
+        drag.move(220f, 220f, maxX = 300, maxY = 200)
+        assertEquals(BallDragResult.Position(70, 90), drag.cancel())
+    }
+
+    @Test
+    fun `landscape panel is capped at half display height`() {
+        assertEquals(500, panelHeightPx(1_000, 900, landscape = true))
+        assertEquals(300, panelHeightPx(1_000, 300, landscape = true))
+        assertEquals(750, panelHeightPx(1_000, 900, landscape = false))
+    }
+
+    @Test
+    fun `panel rendering follows requested state rather than stale physical view`() {
+        assertFalse(shouldRenderPanel(requestedOpen = false, attached = false))
+        assertFalse(shouldRenderPanel(requestedOpen = false, attached = true))
+        assertTrue(shouldRenderPanel(requestedOpen = true, attached = false))
+        assertFalse(shouldRenderPanel(requestedOpen = true, attached = true))
+
+        assertFalse(shouldRedrawLayoutPanel(requestedOpen = false, selectionChanged = true))
+        assertFalse(shouldRedrawLayoutPanel(requestedOpen = true, selectionChanged = false))
+        assertTrue(shouldRedrawLayoutPanel(requestedOpen = true, selectionChanged = true))
     }
 }

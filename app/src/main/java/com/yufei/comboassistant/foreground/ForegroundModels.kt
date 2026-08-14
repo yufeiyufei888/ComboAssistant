@@ -47,6 +47,10 @@ data class ForegroundObservation(
     val source: ForegroundObservationSource,
     val kind: ForegroundObservationKind,
     val observedAtElapsedRealtimeMs: Long,
+    /** When this process received/sampled the observation; source event time remains above. */
+    val receivedAtElapsedRealtimeMs: Long = observedAtElapsedRealtimeMs,
+    /** Monotonic time of the lifecycle change proving a UsageStats state snapshot, if available. */
+    val sourceEventAtElapsedRealtimeMs: Long? = null,
     val sourceEventWallTimeMs: Long? = null,
     val display: ForegroundDisplayInfo? = null,
 )
@@ -144,8 +148,10 @@ sealed interface ForegroundSessionState {
 
 enum class ForegroundDecision {
     IGNORED_INVALID_PACKAGE,
+    IGNORED_NON_FOREGROUND_OVERLAY,
     IGNORED_STALE_OBSERVATION,
     IGNORED_RECENT_ACCESSIBILITY_CONFLICT,
+    IGNORED_CONTENT_WITHOUT_FOREGROUND_EVIDENCE,
     CANDIDATE_STARTED,
     CANDIDATE_UPDATED,
     CANDIDATE_NOT_READY,
@@ -167,11 +173,24 @@ data class ForegroundTransition(
     val decision: ForegroundDecision,
 ) {
     val changed: Boolean get() = previous != current
+
+    /** Only a real candidate observation may (re)schedule its stability deadline. */
+    val shouldScheduleCandidateSettlement: Boolean
+        get() = current is ForegroundSessionState.Candidate &&
+            decision == ForegroundDecision.CANDIDATE_STARTED
 }
 
 enum class ForegroundPackageKind {
     INVALID,
     OWN_APP,
+    /**
+     * A package that may emit accessibility window events without becoming foreground itself.
+     *
+     * This is deliberately different from [TRANSIENT]: a transient IME/SystemUI window blocks
+     * execution, whereas a non-interactive screenshot/plugin event must not replace or obscure
+     * the already observed foreground application.
+     */
+    IGNORED_OVERLAY,
     TRANSIENT,
     EXTERNAL,
 }
@@ -184,14 +203,17 @@ fun interface ForegroundPackageClassifier {
 class SetBasedForegroundPackageClassifier(
     private val ownPackageName: String,
     transientPackages: Set<String>,
+    ignoredOverlayPackages: Set<String> = DEFAULT_IGNORED_OVERLAY_PACKAGES,
 ) : ForegroundPackageClassifier {
     private val transientPackages = transientPackages.mapTo(mutableSetOf()) { it.trim() }
+    private val ignoredOverlayPackages = ignoredOverlayPackages.mapTo(mutableSetOf()) { it.trim() }
 
     override fun classify(packageName: String?): ForegroundPackageKind {
         val normalized = packageName?.trim().orEmpty()
         return when {
             normalized.isEmpty() -> ForegroundPackageKind.INVALID
             normalized == ownPackageName -> ForegroundPackageKind.OWN_APP
+            normalized in ignoredOverlayPackages -> ForegroundPackageKind.IGNORED_OVERLAY
             normalized in transientPackages -> ForegroundPackageKind.TRANSIENT
             else -> ForegroundPackageKind.EXTERNAL
         }
@@ -203,6 +225,17 @@ class SetBasedForegroundPackageClassifier(
             "com.android.systemui",
             "com.android.permissioncontroller",
             "com.google.android.permissioncontroller",
+        )
+
+        /**
+         * OEM packages observed on HyperOS that emit window events for a screenshot/system UI
+         * surface while the underlying game remains foreground. Keep this exact and conservative:
+         * real third-party packages must continue through the normal candidate/switch path.
+         */
+        val DEFAULT_IGNORED_OVERLAY_PACKAGES: Set<String> = setOf(
+            "com.miui.screenshot",
+            "miui.systemui.plugin",
+            "com.miui.systemui.plugin",
         )
     }
 }

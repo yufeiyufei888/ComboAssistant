@@ -25,8 +25,11 @@ enum class GestureResult { COMPLETED, CANCELLED, REJECTED }
 
 interface GesturePerformer {
     suspend fun perform(segment: GestureSegment, speed: Float, display: DisplaySnapshot): GestureResult
-    fun cancelActive()
+    fun cancelActive(): CancelRequestResult
 }
+
+/** Whether Android accepted the best-effort gesture used to cancel the current injection. */
+enum class CancelRequestResult { ACCEPTED, UNAVAILABLE, REJECTED }
 
 sealed interface ExecutionGateResult {
     data class Allowed(val display: DisplaySnapshot) : ExecutionGateResult
@@ -109,8 +112,13 @@ class PlaybackEngine(
     fun stop(reason: String) {
         val activeJob = playbackJob ?: return
         if (activeJob.isCompleted) return
-        mutableState.value = PlaybackState.Stopped(reason)
-        performer.cancelActive()
+        val cancellation = performer.cancelActive()
+        val reportedReason = if (cancellation == CancelRequestResult.ACCEPTED) {
+            reason
+        } else {
+            "$reason；后续动作已停止，但系统未接受当前手势的取消请求，本段可能继续到结束"
+        }
+        mutableState.value = PlaybackState.Stopped(reportedReason)
         activeJob.cancel()
     }
 

@@ -49,13 +49,19 @@ class AndroidGesturePerformer(
         }
     }
 
-    override fun cancelActive() {
-        val point = cancelPointProvider() ?: return
+    override fun cancelActive(): CancelRequestResult {
+        val point = cancelPointProvider() ?: return CancelRequestResult.UNAVAILABLE
         val path = Path().apply { moveTo(point.x, point.y) }
         val gesture = GestureDescription.Builder()
             .addStroke(GestureDescription.StrokeDescription(path, 0L, 16L))
             .build()
-        service.dispatchGesture(gesture, null, null)
+        return runCatching { service.dispatchGesture(gesture, null, null) }
+            .fold(
+                onSuccess = { accepted ->
+                    if (accepted) CancelRequestResult.ACCEPTED else CancelRequestResult.REJECTED
+                },
+                onFailure = { CancelRequestResult.REJECTED },
+            )
     }
 
     private fun buildGesture(
