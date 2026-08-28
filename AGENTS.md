@@ -10,4 +10,4 @@ Before changing or validating this Android project, read [docs/testing.md](docs/
 - Run the smallest relevant tests after each change and distinguish static/automated verification from Redmi K80 Pro acceptance.
 - Do not claim real-game compatibility without device evidence.
 - Keep API 35 instrumented tests in every PR/main CI run and API 26 compatibility tests in the scheduled/manual job.
-- Never publish the temporary CI-signed APK as the Beta. The pre-release files are `ComboAssistant-v0.2.0-beta.2-debug.apk` and `SHA256SUMS.txt`, rebuilt from merged `main` and checked against the signer recorded in [docs/testing.md](docs/testing.md).
+- Never publish the temporary CI-signed APK as the Beta. The next pre-release files are `ComboAssistant-v0.2.0-beta.3-debug.apk` and `SHA256SUMS.txt`, rebuilt from merged `main` and checked against the signer recorded in [docs/testing.md](docs/testing.md).

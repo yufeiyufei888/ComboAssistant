@@ -20,6 +20,9 @@ data class GlobalSettings(
     val enhancedForegroundDetection: Boolean = false,
     val ballX: Float = 0.04f,
     val ballY: Float = 0.42f,
+    val stopButtonX: Float = 0.98f,
+    val stopButtonY: Float = 0.03f,
+    val stopButtonSizeDp: Float = 40f,
 )
 
 @Singleton
@@ -33,6 +36,9 @@ class GlobalSettingsRepository @Inject constructor(
         val enhancedForegroundDetection = booleanPreferencesKey("enhanced_foreground_detection")
         val ballX = floatPreferencesKey("ball_x")
         val ballY = floatPreferencesKey("ball_y")
+        val stopButtonX = floatPreferencesKey("stop_button_x")
+        val stopButtonY = floatPreferencesKey("stop_button_y")
+        val stopButtonSizeDp = floatPreferencesKey("stop_button_size_dp")
     }
 
     val settings: Flow<GlobalSettings> = context.comboSettingsDataStore.data.map { prefs ->
@@ -43,6 +49,9 @@ class GlobalSettingsRepository @Inject constructor(
             enhancedForegroundDetection = prefs[Keys.enhancedForegroundDetection] ?: false,
             ballX = prefs[Keys.ballX] ?: 0.04f,
             ballY = prefs[Keys.ballY] ?: 0.42f,
+            stopButtonX = (prefs[Keys.stopButtonX] ?: 0.98f).coerceIn(0f, 1f),
+            stopButtonY = (prefs[Keys.stopButtonY] ?: 0.03f).coerceIn(0f, 1f),
+            stopButtonSizeDp = (prefs[Keys.stopButtonSizeDp] ?: 40f).coerceIn(36f, 72f),
         )
     }
 
@@ -56,6 +65,23 @@ class GlobalSettingsRepository @Inject constructor(
         context.comboSettingsDataStore.edit {
             it[Keys.ballX] = x.coerceIn(0f, 1f)
             it[Keys.ballY] = y.coerceIn(0f, 1f)
+        }
+    }
+
+    /** Saves the two global overlay controls as one DataStore edit during layout commit. */
+    suspend fun setOverlayLayout(
+        ballX: Float,
+        ballY: Float,
+        stopButtonX: Float,
+        stopButtonY: Float,
+        stopButtonSizeDp: Float,
+    ) {
+        context.comboSettingsDataStore.edit {
+            it[Keys.ballX] = ballX.coerceIn(0f, 1f)
+            it[Keys.ballY] = ballY.coerceIn(0f, 1f)
+            it[Keys.stopButtonX] = stopButtonX.coerceIn(0f, 1f)
+            it[Keys.stopButtonY] = stopButtonY.coerceIn(0f, 1f)
+            it[Keys.stopButtonSizeDp] = stopButtonSizeDp.coerceIn(36f, 72f)
         }
     }
 

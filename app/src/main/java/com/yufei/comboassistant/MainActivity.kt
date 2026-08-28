@@ -1,6 +1,5 @@
 package com.yufei.comboassistant
 
-import android.accessibilityservice.AccessibilityServiceInfo
 import android.app.AppOpsManager
 import android.content.Context
 import android.content.Intent
@@ -8,7 +7,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
-import android.view.accessibility.AccessibilityManager
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
@@ -65,6 +64,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.yufei.comboassistant.domain.Combo
+import com.yufei.comboassistant.service.comboAccessibilityServiceConnection
 import com.yufei.comboassistant.ui.theme.ComboAssistantTheme
 import dagger.hilt.android.AndroidEntryPoint
 import java.util.Locale
@@ -73,7 +73,7 @@ import kotlin.math.roundToInt
 @AndroidEntryPoint
 class MainActivity : ComponentActivity() {
     private val viewModel: MainViewModel by viewModels()
-    private val serviceEnabled = mutableStateOf(false)
+    private val serviceSystemEnabled = mutableStateOf(false)
     private val usageAccessGranted = mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -81,9 +81,14 @@ class MainActivity : ComponentActivity() {
         setContent {
             ComboAssistantTheme {
                 val state by viewModel.state.collectAsStateWithLifecycle()
+                val serviceConnected by
+                    comboAccessibilityServiceConnection.connected.collectAsStateWithLifecycle()
                 MainScreen(
                     state = state,
-                    serviceEnabled = serviceEnabled.value,
+                    serviceStatus = resolveComboServiceStatus(
+                        systemEnabled = serviceSystemEnabled.value,
+                        serviceConnected = serviceConnected,
+                    ),
                     usageAccessGranted = usageAccessGranted.value,
                     onAcceptDisclosure = viewModel::setDisclosureAccepted,
                     onOpenAccessibility = {
@@ -93,6 +98,8 @@ class MainActivity : ComponentActivity() {
                     onSetButtonsHidden = viewModel::setButtonsHidden,
                     onSetEnhancedForegroundDetection = viewModel::setEnhancedForegroundDetection,
                     onOpenUsageAccess = ::openUsageAccessSettings,
+                    onOpenAutostartSettings = ::openAutostartSettings,
+                    onOpenBatterySettings = ::openBatterySettings,
                     onSaveCombo = viewModel::save,
                     onDeleteCombo = viewModel::delete,
                     onOpenTouchTest = {
@@ -107,8 +114,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        serviceEnabled.value = isComboServiceEnabled(this)
-        usageAccessGranted.value = isUsageAccessGranted(this)
+        refreshSystemStatus()
     }
 
     private fun openUsageAccessSettings() {
@@ -116,13 +122,24 @@ class MainActivity : ComponentActivity() {
         runCatching { startActivity(targetedIntent) }
             .onFailure { startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)) }
     }
-}
 
-fun isComboServiceEnabled(context: Context): Boolean {
-    val manager = context.getSystemService(Context.ACCESSIBILITY_SERVICE) as AccessibilityManager
-    return manager.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK).any {
-        it.resolveInfo.serviceInfo.packageName == context.packageName &&
-            it.resolveInfo.serviceInfo.name.endsWith("ComboAccessibilityService")
+    private fun openAutostartSettings() {
+        openFirstAvailableSettings(createHyperOsAutostartSettingsIntents(this))
+    }
+
+    private fun openBatterySettings() {
+        openFirstAvailableSettings(createHyperOsBatterySettingsIntents(this))
+    }
+
+    private fun openFirstAvailableSettings(intents: List<Intent>) {
+        if (!launchFirstAvailableSettings(intents, ::startActivity)) {
+            Toast.makeText(this, "无法打开系统设置，请手动检查应用后台运行策略", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun refreshSystemStatus() {
+        serviceSystemEnabled.value = isComboServiceEnabled(this)
+        usageAccessGranted.value = isUsageAccessGranted(this)
     }
 }
 
@@ -155,7 +172,7 @@ fun createUsageAccessSettingsIntent(context: Context): Intent =
 @Composable
 fun MainScreen(
     state: MainUiState,
-    serviceEnabled: Boolean,
+    serviceStatus: ComboServiceStatus,
     usageAccessGranted: Boolean,
     onAcceptDisclosure: (Boolean) -> Unit,
     onOpenAccessibility: () -> Unit,
@@ -163,6 +180,8 @@ fun MainScreen(
     onSetButtonsHidden: (Boolean) -> Unit,
     onSetEnhancedForegroundDetection: (Boolean) -> Unit,
     onOpenUsageAccess: () -> Unit,
+    onOpenAutostartSettings: () -> Unit,
+    onOpenBatterySettings: () -> Unit,
     onSaveCombo: (Combo) -> Unit,
     onDeleteCombo: (String) -> Unit,
     onOpenTouchTest: () -> Unit,
@@ -197,9 +216,11 @@ fun MainScreen(
             item {
                 PermissionCard(
                     disclosureAccepted = state.settings.disclosureAccepted,
-                    serviceEnabled = serviceEnabled,
+                    serviceStatus = serviceStatus,
                     onAcceptDisclosure = onAcceptDisclosure,
                     onOpenAccessibility = onOpenAccessibility,
+                    onOpenAutostartSettings = onOpenAutostartSettings,
+                    onOpenBatterySettings = onOpenBatterySettings,
                 )
             }
             item {
@@ -304,23 +325,55 @@ fun MainScreen(
 @Composable
 private fun PermissionCard(
     disclosureAccepted: Boolean,
-    serviceEnabled: Boolean,
+    serviceStatus: ComboServiceStatus,
     onAcceptDisclosure: (Boolean) -> Unit,
     onOpenAccessibility: () -> Unit,
+    onOpenAutostartSettings: () -> Unit,
+    onOpenBatterySettings: () -> Unit,
 ) {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Surface(
-                    color = if (serviceEnabled) MaterialTheme.colorScheme.primaryContainer
-                    else MaterialTheme.colorScheme.errorContainer,
+                    color = when (serviceStatus) {
+                        ComboServiceStatus.CONNECTED -> MaterialTheme.colorScheme.primaryContainer
+                        ComboServiceStatus.ENABLED_WAITING_FOR_CONNECTION ->
+                            MaterialTheme.colorScheme.tertiaryContainer
+                        ComboServiceStatus.DISABLED -> MaterialTheme.colorScheme.errorContainer
+                    },
                     shape = MaterialTheme.shapes.extraLarge,
                 ) {
                     Text(
-                        if (serviceEnabled) "触控服务已开启" else "触控服务未开启",
+                        when (serviceStatus) {
+                            ComboServiceStatus.CONNECTED -> "触控服务已连接"
+                            ComboServiceStatus.ENABLED_WAITING_FOR_CONNECTION ->
+                                "系统已启用，等待服务连接"
+                            ComboServiceStatus.DISABLED -> "触控服务未启用"
+                        },
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
                         style = MaterialTheme.typography.labelLarge,
                     )
+                }
+            }
+            if (serviceStatus == ComboServiceStatus.ENABLED_WAITING_FOR_CONNECTION) {
+                Text(
+                    "系统开关仍为启用，但服务当前未连接。应用不能自行重启或重新授权无障碍服务；可先检查无障碍设置，澎湃OS还可检查自启动与省电策略。",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.testTag("service_waiting_guidance"),
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    OutlinedButton(
+                        onClick = onOpenAutostartSettings,
+                        modifier = Modifier.weight(1f).testTag("open_autostart_settings"),
+                    ) { Text("自启动设置") }
+                    OutlinedButton(
+                        onClick = onOpenBatterySettings,
+                        modifier = Modifier.weight(1f).testTag("open_battery_settings"),
+                    ) { Text("省电策略") }
                 }
             }
             Text(
@@ -340,7 +393,13 @@ private fun PermissionCard(
                 enabled = disclosureAccepted,
                 modifier = Modifier.fillMaxWidth().testTag("open_accessibility"),
             ) {
-                Text(if (serviceEnabled) "查看系统触控服务设置" else "前往系统设置开启服务")
+                Text(
+                    when (serviceStatus) {
+                        ComboServiceStatus.CONNECTED -> "查看系统触控服务设置"
+                        ComboServiceStatus.ENABLED_WAITING_FOR_CONNECTION -> "检查系统触控服务设置"
+                        ComboServiceStatus.DISABLED -> "前往系统设置开启服务"
+                    },
+                )
             }
         }
     }

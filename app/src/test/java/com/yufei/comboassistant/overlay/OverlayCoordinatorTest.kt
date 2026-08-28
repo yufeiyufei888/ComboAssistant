@@ -82,7 +82,12 @@ class OverlayCoordinatorTest {
     @Test
     fun layoutSessionCommitsWorkingCopyOrReturnsOriginals() {
         val original = testCombo()
-        val session = LayoutSession(listOf(original), FloatingBallPosition(0.1f, 0.2f))
+        val originalStop = StopButtonLayout(0.8f, 0.1f, 40f)
+        val session = LayoutSession(
+            listOf(original),
+            FloatingBallPosition(0.1f, 0.2f),
+            originalStop,
+        )
         session.moveCombo(original.id, 0.3f, 0.4f)
         session.resizeComboKeepingCenter(original.id, 20f, 1000, 500, 1f)
         session.setOpacity(original.id, 2f)
@@ -99,5 +104,32 @@ class OverlayCoordinatorTest {
 
         assertEquals(original, session.cancelledCombos().single())
         assertEquals(FloatingBallPosition(0.1f, 0.2f), session.cancelledBall())
+        assertEquals(originalStop, session.cancelledStopButton())
+    }
+
+    @Test
+    fun stopButtonLayoutPreservesCenterClampsAndRollsBack() {
+        val originalStop = StopButtonLayout(0.8f, 0.1f, 40f)
+        val session = LayoutSession(
+            combos = emptyList(),
+            ballPosition = FloatingBallPosition(0.1f, 0.2f),
+            stopButtonLayout = originalStop,
+        )
+
+        session.resizeStopButtonKeepingCenter(
+            sizeDp = 80f,
+            displayWidthPx = 1_000,
+            displayHeightPx = 500,
+            density = 1f,
+        )
+        val resized = session.stopButtonLayout()
+        assertEquals(0.8077586f, resized.x, 0.0001f)
+        assertEquals(0.0775701f, resized.y, 0.0001f)
+        assertEquals(72f, resized.sizeDp, 0.0001f)
+
+        session.moveStopButton(2f, -1f)
+        assertEquals(1f, session.stopButtonLayout().x, 0.0001f)
+        assertEquals(0f, session.stopButtonLayout().y, 0.0001f)
+        assertEquals(originalStop, session.cancelledStopButton())
     }
 }

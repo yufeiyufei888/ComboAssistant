@@ -137,6 +137,120 @@ class ForegroundSessionTrackerTest {
     }
 
     @Test
+    fun hyperOsSecurityCenterCanNeverBecomeAGameCandidate() {
+        val tracker = tracker()
+
+        val first = tracker.observe(
+            accessibility(
+                SECURITY_CENTER_PACKAGE,
+                100L,
+                className = "com.miui.securityscan.MainActivity",
+            ),
+        )
+        val repeated = tracker.observe(
+            accessibility(
+                SECURITY_CENTER_PACKAGE,
+                500L,
+                className = "android.widget.FrameLayout",
+                kind = ForegroundObservationKind.WINDOW_CONTENT_CHANGED,
+            ),
+        )
+        val settled = tracker.settle(1_000L)
+
+        assertEquals(ForegroundDecision.TEMPORARILY_OBSCURED, first.decision)
+        assertEquals(ForegroundDecision.TEMPORARILY_OBSCURED, repeated.decision)
+        assertEquals(ForegroundDecision.NO_CANDIDATE, settled.decision)
+        assertTrue(tracker.state is ForegroundSessionState.TemporarilyObscured)
+        assertNull(tracker.activePackageName)
+        assertNull(tracker.candidatePackageName)
+        assertNull(tracker.confirmedPackageName)
+    }
+
+    @Test
+    fun hyperOsSecurityCenterTemporarilyBlocksThenGameEvidenceRestoresSession() {
+        val tracker = tracker()
+        tracker.observe(usage(GAME_PACKAGE, 100L))
+
+        val obscured = tracker.observe(
+            accessibility(
+                SECURITY_CENTER_PACKAGE,
+                200L,
+                className = "android.widget.FrameLayout",
+                kind = ForegroundObservationKind.WINDOW_CONTENT_CHANGED,
+            ),
+        )
+
+        assertEquals(ForegroundDecision.TEMPORARILY_OBSCURED, obscured.decision)
+        assertTrue(tracker.state is ForegroundSessionState.TemporarilyObscured)
+        assertEquals(GAME_PACKAGE, tracker.confirmedPackageName)
+        assertNull(tracker.activePackageName)
+        assertNull(tracker.candidatePackageName)
+
+        val restored = tracker.observe(accessibility(GAME_PACKAGE, 300L))
+
+        assertEquals(ForegroundDecision.CONFIRMED_RESTORED, restored.decision)
+        assertEquals(GAME_PACKAGE, tracker.activePackageName)
+        assertEquals(HiddenReason.NONE, tracker.hiddenReason)
+    }
+
+    @Test
+    fun retainedGameContentCanRestoreAfterSecurityCenterObscuresIt() {
+        val tracker = tracker()
+        tracker.observe(usage(GAME_PACKAGE, 100L))
+        tracker.observe(accessibility(SECURITY_CENTER_PACKAGE, 200L))
+
+        val restored = tracker.observe(
+            accessibility(
+                packageName = GAME_PACKAGE,
+                timeMs = 300L,
+                kind = ForegroundObservationKind.WINDOW_CONTENT_CHANGED,
+            ),
+        )
+
+        assertEquals(ForegroundDecision.CONFIRMED_RESTORED, restored.decision)
+        assertEquals(GAME_PACKAGE, tracker.activePackageName)
+        assertEquals(HiddenReason.NONE, tracker.hiddenReason)
+    }
+
+    @Test
+    fun retainedGameContentCannotBypassImeObscuration() {
+        val tracker = tracker()
+        tracker.observe(usage(GAME_PACKAGE, 100L))
+        tracker.observe(accessibility(IME_PACKAGE, 200L))
+
+        val ignored = tracker.observe(
+            accessibility(
+                packageName = GAME_PACKAGE,
+                timeMs = 300L,
+                kind = ForegroundObservationKind.WINDOW_CONTENT_CHANGED,
+            ),
+        )
+
+        assertEquals(
+            ForegroundDecision.IGNORED_CONTENT_WITHOUT_FOREGROUND_EVIDENCE,
+            ignored.decision,
+        )
+        assertTrue(tracker.state is ForegroundSessionState.TemporarilyObscured)
+        assertNull(tracker.activePackageName)
+        assertEquals(GAME_PACKAGE, tracker.confirmedPackageName)
+    }
+
+    @Test
+    fun realSecurityCenterUsageActivityBlocksAndCannotBeManuallyConfirmed() {
+        val tracker = tracker()
+
+        val observed = tracker.observe(usage(SECURITY_CENTER_PACKAGE, 100L))
+        val manual = tracker.confirmCandidate(200L)
+
+        assertEquals(ForegroundDecision.TEMPORARILY_OBSCURED, observed.decision)
+        assertEquals(ForegroundDecision.NO_CANDIDATE, manual.decision)
+        assertTrue(tracker.state is ForegroundSessionState.TemporarilyObscured)
+        assertNull(tracker.activePackageName)
+        assertNull(tracker.candidatePackageName)
+        assertNull(tracker.confirmedPackageName)
+    }
+
+    @Test
     fun contentChangeCannotCreateSwitchOrConfirmCandidate() {
         val tracker = tracker()
 
@@ -413,5 +527,6 @@ class ForegroundSessionTrackerTest {
         const val GAME_PACKAGE = "com.example.game"
         const val BROWSER_PACKAGE = "com.example.browser"
         const val IME_PACKAGE = "com.example.ime"
+        const val SECURITY_CENTER_PACKAGE = "com.miui.securitycenter"
     }
 }

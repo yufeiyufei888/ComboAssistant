@@ -66,7 +66,7 @@ fun MainScreenPreviewScreenshotTest() {
                 combos = listOf(combo),
                 settings = GlobalSettings(disclosureAccepted = true),
             ),
-            serviceEnabled = true,
+            serviceStatus = ComboServiceStatus.CONNECTED,
             usageAccessGranted = true,
             onAcceptDisclosure = {},
             onOpenAccessibility = {},
@@ -74,11 +74,13 @@ fun MainScreenPreviewScreenshotTest() {
             onSetButtonsHidden = {},
             onSetEnhancedForegroundDetection = {},
             onOpenUsageAccess = {},
+            onOpenAutostartSettings = {},
+            onOpenBatterySettings = {},
             onSaveCombo = {},
             onDeleteCombo = {},
             onOpenTouchTest = {},
             showDebugTools = true,
-            appVersion = "0.2.0-beta.2-debug",
+            appVersion = "0.2.0-beta.3-debug",
         )
     }
 }
