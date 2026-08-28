@@ -3,6 +3,9 @@ package com.yufei.comboassistant.service
 import com.yufei.comboassistant.foreground.ConfirmedForegroundPackage
 import com.yufei.comboassistant.foreground.ForegroundConfirmationMethod
 import com.yufei.comboassistant.foreground.ForegroundSessionState
+import com.yufei.comboassistant.domain.DisplaySnapshot
+import com.yufei.comboassistant.domain.ScreenOrientation
+import com.yufei.comboassistant.overlay.StopButtonLayout
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -160,5 +163,58 @@ class ServiceStateTest {
         assertFalse(shouldRedrawLayoutPanel(requestedOpen = false, selectionChanged = true))
         assertFalse(shouldRedrawLayoutPanel(requestedOpen = true, selectionChanged = false))
         assertTrue(shouldRedrawLayoutPanel(requestedOpen = true, selectionChanged = true))
+    }
+
+    @Test
+    fun `small stop visual retains 48dp hit target and normalized position`() {
+        val geometry = stopButtonGeometry(
+            layout = StopButtonLayout(x = 1f, y = 0.5f, sizeDp = 36f),
+            display = DisplaySnapshot(1_000, 500, ScreenOrientation.LANDSCAPE),
+            density = 2f,
+        )
+
+        assertEquals(72, geometry.visualSizePx)
+        assertEquals(96, geometry.hitSizePx)
+        assertEquals(904, geometry.x)
+        assertEquals(202, geometry.y)
+    }
+
+    @Test
+    fun `stop button size and position are clamped to supported bounds`() {
+        val geometry = stopButtonGeometry(
+            layout = StopButtonLayout(x = 2f, y = -1f, sizeDp = 100f),
+            display = DisplaySnapshot(200, 100, ScreenOrientation.LANDSCAPE),
+            density = 1f,
+        )
+
+        assertEquals(72, geometry.visualSizePx)
+        assertEquals(72, geometry.hitSizePx)
+        assertEquals(128, geometry.x)
+        assertEquals(0, geometry.y)
+    }
+
+    @Test
+    fun `cancelled layout save stays blocked until compensation job completes`() {
+        assertTrue(
+            shouldBlockLayoutInteractions(
+                saveJobPresent = true,
+                saveJobCompleted = false,
+                recoveryFailed = false,
+            ),
+        )
+        assertFalse(
+            shouldBlockLayoutInteractions(
+                saveJobPresent = true,
+                saveJobCompleted = true,
+                recoveryFailed = false,
+            ),
+        )
+        assertTrue(
+            shouldBlockLayoutInteractions(
+                saveJobPresent = false,
+                saveJobCompleted = true,
+                recoveryFailed = true,
+            ),
+        )
     }
 }

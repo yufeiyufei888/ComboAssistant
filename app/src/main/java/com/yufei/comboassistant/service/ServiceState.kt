@@ -2,6 +2,7 @@ package com.yufei.comboassistant.service
 
 import com.yufei.comboassistant.domain.DisplaySnapshot
 import com.yufei.comboassistant.foreground.ForegroundSessionState
+import com.yufei.comboassistant.overlay.StopButtonLayout
 
 sealed interface DisplayState {
     data class Stable(val snapshot: DisplaySnapshot) : DisplayState
@@ -9,6 +10,31 @@ sealed interface DisplayState {
 }
 
 enum class OverlayMode { LOCKED, LAYOUT }
+
+internal data class StopButtonGeometry(
+    val visualSizePx: Int,
+    val hitSizePx: Int,
+    val x: Int,
+    val y: Int,
+)
+
+/** Keeps a 36dp visual usable without shrinking Android's 48dp minimum touch target. */
+internal fun stopButtonGeometry(
+    layout: StopButtonLayout,
+    display: DisplaySnapshot,
+    density: Float,
+): StopButtonGeometry {
+    val safeDensity = density.coerceAtLeast(0.01f)
+    val visualDp = layout.sizeDp.coerceIn(36f, 72f)
+    val visualSize = (visualDp * safeDensity).toInt().coerceAtLeast(1)
+    val hitSize = (maxOf(visualDp, 48f) * safeDensity).toInt().coerceAtLeast(1)
+    return StopButtonGeometry(
+        visualSizePx = visualSize,
+        hitSizePx = hitSize,
+        x = (layout.x.coerceIn(0f, 1f) * (display.width - hitSize).coerceAtLeast(0)).toInt(),
+        y = (layout.y.coerceIn(0f, 1f) * (display.height - hitSize).coerceAtLeast(0)).toInt(),
+    )
+}
 
 sealed interface RecordingState {
     data object Idle : RecordingState
@@ -88,6 +114,13 @@ internal fun shouldRenderPanel(requestedOpen: Boolean, attached: Boolean): Boole
 /** Layout selection may redraw an open panel, but never changes an explicit closed intent. */
 internal fun shouldRedrawLayoutPanel(requestedOpen: Boolean, selectionChanged: Boolean): Boolean =
     requestedOpen && selectionChanged
+
+/** A cancelled Job remains blocking until NonCancellable compensation and finally both finish. */
+internal fun shouldBlockLayoutInteractions(
+    saveJobPresent: Boolean,
+    saveJobCompleted: Boolean,
+    recoveryFailed: Boolean,
+): Boolean = recoveryFailed || (saveJobPresent && !saveJobCompleted)
 
 /** Keeps a layout save single-flight and rejects stale completion callbacks. */
 internal class LayoutCommitGuard {

@@ -33,7 +33,7 @@ class MainScreenTest {
             ComboAssistantTheme {
                 MainScreen(
                     state = MainUiState(settings = GlobalSettings(disclosureAccepted = accepted.value)),
-                    serviceEnabled = false,
+                    serviceStatus = ComboServiceStatus.DISABLED,
                     usageAccessGranted = false,
                     onAcceptDisclosure = { accepted.value = it },
                     onOpenAccessibility = {},
@@ -41,11 +41,13 @@ class MainScreenTest {
                     onSetButtonsHidden = {},
                     onSetEnhancedForegroundDetection = {},
                     onOpenUsageAccess = {},
+                    onOpenAutostartSettings = {},
+                    onOpenBatterySettings = {},
                     onSaveCombo = {},
                     onDeleteCombo = {},
                     onOpenTouchTest = {},
                     showDebugTools = false,
-                    appVersion = "0.2.0-beta.2-debug",
+                    appVersion = "0.2.0-beta.3-debug",
                 )
             }
         }
@@ -64,7 +66,7 @@ class MainScreenTest {
                         combos = listOf(testCombo()),
                         settings = GlobalSettings(disclosureAccepted = true),
                     ),
-                    serviceEnabled = true,
+                    serviceStatus = ComboServiceStatus.CONNECTED,
                     usageAccessGranted = true,
                     onAcceptDisclosure = {},
                     onOpenAccessibility = {},
@@ -72,11 +74,13 @@ class MainScreenTest {
                     onSetButtonsHidden = {},
                     onSetEnhancedForegroundDetection = {},
                     onOpenUsageAccess = {},
+                    onOpenAutostartSettings = {},
+                    onOpenBatterySettings = {},
                     onSaveCombo = {},
                     onDeleteCombo = {},
                     onOpenTouchTest = {},
                     showDebugTools = true,
-                    appVersion = "0.2.0-beta.2-debug",
+                    appVersion = "0.2.0-beta.3-debug",
                 )
             }
         }
@@ -101,7 +105,7 @@ class MainScreenTest {
                             enhancedForegroundDetection = enhanced.value,
                         ),
                     ),
-                    serviceEnabled = true,
+                    serviceStatus = ComboServiceStatus.CONNECTED,
                     usageAccessGranted = false,
                     onAcceptDisclosure = {},
                     onOpenAccessibility = {},
@@ -109,11 +113,13 @@ class MainScreenTest {
                     onSetButtonsHidden = {},
                     onSetEnhancedForegroundDetection = { enhanced.value = it },
                     onOpenUsageAccess = { openSettingsCount += 1 },
+                    onOpenAutostartSettings = {},
+                    onOpenBatterySettings = {},
                     onSaveCombo = {},
                     onDeleteCombo = {},
                     onOpenTouchTest = {},
                     showDebugTools = false,
-                    appVersion = "0.2.0-beta.2-debug",
+                    appVersion = "0.2.0-beta.3-debug",
                 )
             }
         }
@@ -132,7 +138,7 @@ class MainScreenTest {
             ComboAssistantTheme {
                 MainScreen(
                     state = MainUiState(),
-                    serviceEnabled = false,
+                    serviceStatus = ComboServiceStatus.DISABLED,
                     usageAccessGranted = false,
                     onAcceptDisclosure = {},
                     onOpenAccessibility = {},
@@ -140,11 +146,13 @@ class MainScreenTest {
                     onSetButtonsHidden = {},
                     onSetEnhancedForegroundDetection = {},
                     onOpenUsageAccess = {},
+                    onOpenAutostartSettings = {},
+                    onOpenBatterySettings = {},
                     onSaveCombo = {},
                     onDeleteCombo = {},
                     onOpenTouchTest = {},
                     showDebugTools = false,
-                    appVersion = "0.2.0-beta.2-debug",
+                    appVersion = "0.2.0-beta.3-debug",
                 )
             }
         }
@@ -152,5 +160,42 @@ class MainScreenTest {
         composeRule.onNodeWithText(
             "3. 录制期间触摸由透明录制层接收，游戏不会同步响应。点击“结束并保存”后统一生成连招，不会自动试播。",
         ).performScrollTo().assertIsDisplayed()
+    }
+
+    @Test
+    fun enabledButDisconnectedServiceShowsHyperOsRecoveryGuidance() {
+        var autostartCount = 0
+        var batteryCount = 0
+        composeRule.setContent {
+            ComboAssistantTheme {
+                MainScreen(
+                    state = MainUiState(settings = GlobalSettings(disclosureAccepted = true)),
+                    serviceStatus = ComboServiceStatus.ENABLED_WAITING_FOR_CONNECTION,
+                    usageAccessGranted = false,
+                    onAcceptDisclosure = {},
+                    onOpenAccessibility = {},
+                    onSetFloatingBall = {},
+                    onSetButtonsHidden = {},
+                    onSetEnhancedForegroundDetection = {},
+                    onOpenUsageAccess = {},
+                    onOpenAutostartSettings = { autostartCount += 1 },
+                    onOpenBatterySettings = { batteryCount += 1 },
+                    onSaveCombo = {},
+                    onDeleteCombo = {},
+                    onOpenTouchTest = {},
+                    showDebugTools = false,
+                    appVersion = "0.2.0-beta.3-debug",
+                )
+            }
+        }
+
+        composeRule.onNodeWithText("系统已启用，等待服务连接").assertIsDisplayed()
+        composeRule.onNodeWithTag("service_waiting_guidance").assertIsDisplayed()
+        composeRule.onNodeWithTag("open_autostart_settings").performClick()
+        composeRule.onNodeWithTag("open_battery_settings").performClick()
+        composeRule.runOnIdle {
+            assertEquals(1, autostartCount)
+            assertEquals(1, batteryCount)
+        }
     }
 }

@@ -60,8 +60,11 @@ class ForegroundSessionTracker(
         if (
             observation.source == ForegroundObservationSource.ACCESSIBILITY &&
             observation.kind == ForegroundObservationKind.WINDOW_CONTENT_CHANGED &&
+            packageName !in
+                SetBasedForegroundPackageClassifier.DEFAULT_FAIL_CLOSED_TRANSIENT_PACKAGES &&
             state.activePackageName != packageName &&
-            state.candidatePackageName != packageName
+            state.candidatePackageName != packageName &&
+            !canRestoreRetainedGameFromFailClosedOverlay(packageName)
         ) {
             return transition(
                 observation,
@@ -223,6 +226,13 @@ class ForegroundSessionTracker(
         ),
         ForegroundDecision.TEMPORARILY_OBSCURED,
     )
+
+    private fun canRestoreRetainedGameFromFailClosedOverlay(packageName: String): Boolean {
+        val obscured = state as? ForegroundSessionState.TemporarilyObscured ?: return false
+        return obscured.obscuringPackageName in
+            SetBasedForegroundPackageClassifier.DEFAULT_FAIL_CLOSED_TRANSIENT_PACKAGES &&
+            obscured.confirmation?.packageName == packageName
+    }
 
     private fun observeExternal(
         observation: ForegroundObservation,

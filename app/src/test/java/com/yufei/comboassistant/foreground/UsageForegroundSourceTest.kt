@@ -42,6 +42,24 @@ class UsageForegroundSourceTest {
     }
 
     @Test
+    fun `security center lifecycle remains observable for fail closed classification`() {
+        val reducer = UsageForegroundReducer()
+        reducer.accept(resumed(GAME, "MatchActivity", 100L))
+        reducer.accept(resumed(SECURITY_CENTER, "MainActivity", 200L))
+        assertNull(reducer.snapshot())
+
+        reducer.accept(paused(GAME, "MatchActivity", 250L))
+
+        val securityCenter = reducer.snapshot()
+        assertEquals(SECURITY_CENTER, securityCenter?.packageName)
+        assertEquals("MainActivity", securityCenter?.className)
+        assertEquals(250L, securityCenter?.stateEventWallTimeMs)
+
+        reducer.accept(paused(SECURITY_CENTER, "MainActivity", 300L))
+        assertNull(reducer.snapshot())
+    }
+
+    @Test
     fun `legacy package foreground and background events are paired`() {
         val reducer = UsageForegroundReducer()
         reducer.accept(resumed(GAME, null, 100L, ForegroundObservationKind.MOVE_TO_FOREGROUND))
@@ -109,6 +127,7 @@ class UsageForegroundSourceTest {
     private companion object {
         const val GAME = "com.example.game"
         const val SCREENSHOT = "com.miui.screenshot"
+        const val SECURITY_CENTER = "com.miui.securitycenter"
         const val BROWSER = "com.example.browser"
     }
 }

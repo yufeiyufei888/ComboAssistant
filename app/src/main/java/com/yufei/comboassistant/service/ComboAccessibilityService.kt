@@ -73,6 +73,7 @@ import com.yufei.comboassistant.overlay.CapturedGesture
 import com.yufei.comboassistant.overlay.FloatingBallPosition
 import com.yufei.comboassistant.overlay.LayoutSession
 import com.yufei.comboassistant.overlay.OverlayCoordinator
+import com.yufei.comboassistant.overlay.StopButtonLayout
 import com.yufei.comboassistant.playback.AndroidGesturePerformer
 import com.yufei.comboassistant.playback.ExecutionGateResult
 import com.yufei.comboassistant.playback.PlaybackEngine
@@ -85,16 +86,22 @@ import java.util.UUID
 import javax.inject.Inject
 import kotlin.math.abs
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 @AndroidEntryPoint
 class ComboAccessibilityService : AccessibilityService() {
@@ -113,6 +120,14 @@ class ComboAccessibilityService : AccessibilityService() {
         val visual: TextView,
         val layoutRing: View,
         val params: WindowManager.LayoutParams,
+    )
+
+    private data class StopButtonEntry(
+        val root: FrameLayout,
+        val visual: TextView,
+        val layoutRing: View,
+        val params: WindowManager.LayoutParams,
+        var layoutPreview: Boolean? = null,
     )
 
     private data class PanelWindow(
@@ -151,7 +166,10 @@ class ComboAccessibilityService : AccessibilityService() {
     private var layoutSession: LayoutSession? = null
     private var layoutTargetPackage: String? = null
     private var selectedLayoutComboId: String? = null
+    private var layoutStopSelected = false
     private var layoutSessionId: String? = null
+    private var layoutSaveJob: Job? = null
+    private var layoutRecoveryFailure: String? = null
 
     private var ballView: TextView? = null
     private var ballParams: WindowManager.LayoutParams? = null
@@ -174,8 +192,7 @@ class ComboAccessibilityService : AccessibilityService() {
         }
     }
 
-    private var playbackStopView: TextView? = null
-    private var playbackStopParams: WindowManager.LayoutParams? = null
+    private var playbackStopEntry: StopButtonEntry? = null
 
     private var recordingView: CaptureOverlayView? = null
     private var recordingParams: WindowManager.LayoutParams? = null
@@ -205,6 +222,15 @@ class ComboAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
+        // A reconnect must not keep a stale "connected" signal if critical initialization below
+        // fails. Publish CONNECTED only after lifecycle guards, observers and overlays are ready.
+        comboAccessibilityServiceConnection.markDisconnected()
+        if (!isLayoutPersistencePending()) layoutRecoveryFailure = null
+        if (overlayMode == OverlayMode.LAYOUT) {
+            cancelLayoutMode(silent = true)
+        } else {
+            layoutSaveJob?.cancel(CancellationException("无障碍服务正在重新连接"))
+        }
         // Android can reconnect the same service instance. Tear down connection-scoped work
         // before rebuilding the trackers so collectors and callbacks never multiply.
         if (activeRecordingSessionId() != null) {
@@ -288,6 +314,7 @@ class ComboAccessibilityService : AccessibilityService() {
         }
         updateUsagePolling()
         refreshOverlays()
+        comboAccessibilityServiceConnection.markConnected()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -354,7 +381,13 @@ class ComboAccessibilityService : AccessibilityService() {
         refreshOverlays()
     }
 
+    override fun onUnbind(intent: Intent?): Boolean {
+        comboAccessibilityServiceConnection.markDisconnected()
+        return super.onUnbind(intent)
+    }
+
     override fun onDestroy() {
+        comboAccessibilityServiceConnection.markDisconnected()
         if (screenOffReceiverRegistered) {
             runCatching { unregisterReceiver(screenOffReceiver) }
             screenOffReceiverRegistered = false
@@ -451,13 +484,17 @@ class ComboAccessibilityService : AccessibilityService() {
 
     private fun refreshOverlays() {
         if (!::windowManager.isInitialized || !::playbackEngine.isInitialized) return
+        val playbackState = playbackEngine.state.value
+        val playbackOwnsStopWindow = playbackState is PlaybackState.Running ||
+            (playbackState is PlaybackState.Stopped && playbackStopEntry != null)
         val busy = recordingState !is RecordingState.Idle ||
-            playbackEngine.state.value is PlaybackState.Running
+            playbackOwnsStopWindow || isLayoutPersistenceBlocked()
         if (!settings.disclosureAccepted || busy) {
             closePanel()
             removeEditor()
             removeBall()
             reconcileComboButtons(emptyMap())
+            if (!playbackOwnsStopWindow) removePlaybackStop()
             return
         }
 
@@ -470,6 +507,11 @@ class ComboAccessibilityService : AccessibilityService() {
             removeBall()
         }
         reconcileComboButtons(desiredComboButtons())
+        if (overlayMode == OverlayMode.LAYOUT) {
+            showPlaybackStop(total = 1, layoutPreview = true)
+        } else if (!playbackOwnsStopWindow) {
+            removePlaybackStop()
+        }
         panelSummaryView?.text = foregroundSummary()
         if (shouldRenderPanel(
                 requestedOpen = panelRequestedOpen,
@@ -719,6 +761,7 @@ class ComboAccessibilityService : AccessibilityService() {
         val drag = BallDragState(ViewConfiguration.get(this).scaledTouchSlop)
         var panelClosedForDrag = false
         return View.OnTouchListener { _, event ->
+            if (isLayoutPersistenceBlocked()) return@OnTouchListener true
             if (overlayMode == OverlayMode.LAYOUT && layoutCommitGuard.isSaving(layoutSessionId)) {
                 return@OnTouchListener true
             }
@@ -836,7 +879,7 @@ class ComboAccessibilityService : AccessibilityService() {
             body.addView(panelButton("识别不到游戏？前往增强识别") { openMainActivity() })
         }
         body.addView(panelButton("● 新建连续录制") { startRecording() })
-        body.addView(panelButton("布局按键") { beginLayoutMode() })
+        body.addView(panelButton("布局按键与停止键") { beginLayoutMode() })
         body.addView(
             panelButton(if (settings.buttonsHidden) "显示全部连招键" else "隐藏全部连招键") {
                 scope.launch { settingsRepository.setButtonsHidden(!settings.buttonsHidden) }
@@ -862,7 +905,20 @@ class ComboAccessibilityService : AccessibilityService() {
         return true
     }
 
+    private fun isLayoutPersistencePending(): Boolean = layoutSaveJob?.isCompleted == false
+
+    private fun isLayoutPersistenceBlocked(): Boolean =
+        shouldBlockLayoutInteractions(
+            saveJobPresent = layoutSaveJob != null,
+            saveJobCompleted = layoutSaveJob?.isCompleted == true,
+            recoveryFailed = layoutRecoveryFailure != null,
+        )
+
     private fun beginLayoutMode(preferredCombo: Combo? = null) {
+        if (isLayoutPersistenceBlocked()) {
+            toast(layoutRecoveryFailure ?: "正在恢复上一次布局，请稍候")
+            return
+        }
         val target = foregroundTracker.activePackageName
         val display = stableDisplay()
         if (target == null || display == null) {
@@ -878,10 +934,6 @@ class ComboAccessibilityService : AccessibilityService() {
             source.removeAll { it.id == preferred.id }
             source += preferred
         }
-        if (source.isEmpty()) {
-            toast("当前游戏没有可布局的连招键")
-            return
-        }
         closePanel()
         if (!removeEditor()) {
             toast("旧悬浮窗尚未关闭，请稍后重试")
@@ -893,9 +945,15 @@ class ComboAccessibilityService : AccessibilityService() {
         layoutSession = LayoutSession(
             source,
             optimisticBallPosition ?: FloatingBallPosition(settings.ballX, settings.ballY),
+            StopButtonLayout(
+                x = settings.stopButtonX,
+                y = settings.stopButtonY,
+                sizeDp = settings.stopButtonSizeDp,
+            ),
         )
         selectedLayoutComboId = preferredCombo?.id?.takeIf { id -> source.any { it.id == id } }
-            ?: source.first().id
+            ?: source.firstOrNull()?.id
+        layoutStopSelected = selectedLayoutComboId == null
         panelRequestedOpen = true
         if (!showOrUpdateBall()) {
             cancelLayoutMode(silent = true)
@@ -903,6 +961,11 @@ class ComboAccessibilityService : AccessibilityService() {
             return
         }
         reconcileComboButtons(desiredComboButtons())
+        if (!showPlaybackStop(total = 1, layoutPreview = true)) {
+            cancelLayoutMode(silent = true)
+            toast("无法显示紧急停止键预览，请稍后重试")
+            return
+        }
         if (!showLayoutPanel()) {
             cancelLayoutMode(silent = true)
             toast("无法显示布局面板，已恢复锁定")
@@ -910,11 +973,38 @@ class ComboAccessibilityService : AccessibilityService() {
     }
 
     private fun selectLayoutCombo(comboId: String) {
-        if (overlayMode != OverlayMode.LAYOUT || comboId == selectedLayoutComboId) return
+        if (overlayMode != OverlayMode.LAYOUT ||
+            (comboId == selectedLayoutComboId && !layoutStopSelected)
+        ) return
+        layoutStopSelected = false
         selectedLayoutComboId = comboId
         reconcileComboButtons(desiredComboButtons())
+        // Keep the stop-key selection ring in sync when focus moves back to a combo button.
+        if (!showPlaybackStop(total = 1, layoutPreview = true)) {
+            cancelLayoutMode(silent = true)
+            toast("紧急停止键预览不可用，已恢复锁定")
+            return
+        }
         // Selecting a button updates the layout work copy, but must not reopen a panel that the
         // user explicitly closed with the ball or the fixed close control.
+        if (shouldRedrawLayoutPanel(panelRequestedOpen, selectionChanged = true) &&
+            !showLayoutPanel()
+        ) {
+            cancelLayoutMode(silent = true)
+            toast("布局面板显示失败，已恢复锁定")
+        }
+    }
+
+    private fun selectLayoutStopButton() {
+        if (overlayMode != OverlayMode.LAYOUT || layoutStopSelected) return
+        layoutStopSelected = true
+        selectedLayoutComboId = null
+        reconcileComboButtons(desiredComboButtons())
+        if (!showPlaybackStop(total = 1, layoutPreview = true)) {
+            cancelLayoutMode(silent = true)
+            toast("紧急停止键预览不可用，已恢复锁定")
+            return
+        }
         if (shouldRedrawLayoutPanel(panelRequestedOpen, selectionChanged = true) &&
             !showLayoutPanel()
         ) {
@@ -941,8 +1031,28 @@ class ComboAccessibilityService : AccessibilityService() {
         }
         val selected = selectedLayoutComboId?.let(session::combo)
         val body = panelBodyContainer()
-        body.addView(panelHint("拖动设置球或连招键；布局期间绝不会执行连招"))
-        if (selected != null) {
+        body.addView(panelHint("拖动设置球、连招键或红色停止键；布局期间绝不会执行连招"))
+        if (layoutStopSelected) {
+            val stopButton = session.stopButtonLayout()
+            body.addView(panelHint("已选择：紧急停止键"))
+            addSeek(
+                parent = body,
+                title = "停止键大小",
+                max = 36,
+                progress = (stopButton.sizeDp - 36f).toInt(),
+            ) { value, label ->
+                if (layoutCommitGuard.isSaving(layoutSessionId)) return@addSeek
+                val size = 36f + value
+                label.text = "停止键大小：${size.toInt()}dp"
+                session.resizeStopButtonKeepingCenter(
+                    size,
+                    display.width,
+                    display.height,
+                    resources.displayMetrics.density,
+                )
+                showPlaybackStop(total = 1, layoutPreview = true)
+            }
+        } else if (selected != null) {
             body.addView(panelHint("已选择：${selected.name}"))
             addSeek(
                 parent = body,
@@ -974,6 +1084,7 @@ class ComboAccessibilityService : AccessibilityService() {
                 session.setOpacity(selected.id, opacity)
                 reconcileComboButtons(desiredComboButtons())
             }
+            body.addView(panelButton("选择红色紧急停止键") { selectLayoutStopButton() })
         }
         body.addView(panelButton("完成并锁定") { commitLayoutMode() })
         body.addView(panelButton("取消并恢复") { cancelLayoutMode(silent = false) })
@@ -994,57 +1105,114 @@ class ComboAccessibilityService : AccessibilityService() {
         }
         val ball = session.ballPosition()
         val originalBall = session.cancelledBall()
+        val stopButton = session.stopButtonLayout()
+        val originalStopButton = session.cancelledStopButton()
         val combos = session.committed(System.currentTimeMillis())
+        val originalCombos = session.cancelledCombos()
         discardPanelForRedraw()
         showLayoutPanel()
-        scope.launch {
-            // Room and DataStore cannot share a transaction. Persist the ball first, then apply
-            // the Room transaction; if Room fails, compensate by restoring the previous ball.
-            var ballSaved = false
-            val saveFailure = runCatching {
-                settingsRepository.setBallPosition(ball.x, ball.y)
-                ballSaved = true
-                comboRepository.saveAll(combos)
-            }.exceptionOrNull()
-            val rollbackFailure = if (saveFailure != null && ballSaved) {
-                runCatching {
-                    settingsRepository.setBallPosition(originalBall.x, originalBall.y)
-                }.exceptionOrNull()
-            } else {
-                null
-            }
-            if (!layoutCommitGuard.isSaving(sessionId)) return@launch
-            if (saveFailure != null) {
-                layoutCommitGuard.fail(sessionId)
-                val detail = saveFailure.message ?: "本地存储不可用"
-                toast(
-                    if (rollbackFailure == null) {
-                        "布局保存失败：$detail"
+        val saveJob = scope.launch(start = CoroutineStart.LAZY) {
+            var overlayLayoutSaved = false
+            try {
+                try {
+                    // Room and DataStore cannot share a transaction. Persist the global controls
+                    // first, then the Room work copy. Lifecycle cancellation compensates every
+                    // completed step in NonCancellable context before a new layout may start.
+                    settingsRepository.setOverlayLayout(
+                        ballX = ball.x,
+                        ballY = ball.y,
+                        stopButtonX = stopButton.x,
+                        stopButtonY = stopButton.y,
+                        stopButtonSizeDp = stopButton.sizeDp,
+                    )
+                    overlayLayoutSaved = true
+                    currentCoroutineContext().ensureActive()
+                    comboRepository.saveAll(combos)
+                    currentCoroutineContext().ensureActive()
+                } catch (_: CancellationException) {
+                    val recoveryFailure = withContext(NonCancellable) {
+                        val comboFailure = runCatching {
+                            comboRepository.saveAll(originalCombos)
+                        }.exceptionOrNull()
+                        val settingsFailure = runCatching {
+                            settingsRepository.setOverlayLayout(
+                                ballX = originalBall.x,
+                                ballY = originalBall.y,
+                                stopButtonX = originalStopButton.x,
+                                stopButtonY = originalStopButton.y,
+                                stopButtonSizeDp = originalStopButton.sizeDp,
+                            )
+                        }.exceptionOrNull()
+                        comboFailure ?: settingsFailure
+                    }
+                    if (recoveryFailure != null) {
+                        layoutRecoveryFailure =
+                            "布局自动恢复失败，请重新连接触控服务后检查按键位置"
+                        if (comboAccessibilityServiceConnection.connected.value) {
+                            toast(layoutRecoveryFailure!!)
+                        }
+                    }
+                    return@launch
+                } catch (saveFailure: Throwable) {
+                    val rollbackFailure = if (overlayLayoutSaved) {
+                        withContext(NonCancellable) {
+                            runCatching {
+                                settingsRepository.setOverlayLayout(
+                                    ballX = originalBall.x,
+                                    ballY = originalBall.y,
+                                    stopButtonX = originalStopButton.x,
+                                    stopButtonY = originalStopButton.y,
+                                    stopButtonSizeDp = originalStopButton.sizeDp,
+                                )
+                            }.exceptionOrNull()
+                        }
                     } else {
-                        "布局保存失败且位置回滚失败，请重新进入布局：$detail"
-                    },
-                )
-                // A failed asynchronous save must not override a close request made meanwhile.
-                if (panelRequestedOpen && !showLayoutPanel()) {
-                    cancelLayoutMode(silent = true)
-                    toast("布局面板无法恢复，已返回锁定模式")
+                        null
+                    }
+                    if (!layoutCommitGuard.isSaving(sessionId)) return@launch
+                    layoutCommitGuard.fail(sessionId)
+                    val detail = saveFailure.message ?: "本地存储不可用"
+                    toast(
+                        if (rollbackFailure == null) {
+                            "布局保存失败：$detail"
+                        } else {
+                            "布局保存失败且位置回滚失败，请重新进入布局：$detail"
+                        },
+                    )
+                    // A failed asynchronous save must not override a close request made meanwhile.
+                    if (panelRequestedOpen && !showLayoutPanel()) {
+                        cancelLayoutMode(silent = true)
+                        toast("布局面板无法恢复，已返回锁定模式")
+                    }
+                    return@launch
                 }
-                return@launch
+                if (!layoutCommitGuard.complete(sessionId)) return@launch
+                overlayMode = OverlayMode.LOCKED
+                layoutSession = null
+                layoutTargetPackage = null
+                selectedLayoutComboId = null
+                layoutStopSelected = false
+                layoutSessionId = null
+                closePanel()
+                removePlaybackStop()
+                refreshOverlays()
+                toast("布局已保存并锁定")
+            } finally {
+                if (layoutSaveJob === currentCoroutineContext()[Job]) {
+                    layoutSaveJob = null
+                    if (comboAccessibilityServiceConnection.connected.value) refreshOverlays()
+                }
             }
-            if (!layoutCommitGuard.complete(sessionId)) return@launch
-            overlayMode = OverlayMode.LOCKED
-            layoutSession = null
-            layoutTargetPackage = null
-            selectedLayoutComboId = null
-            layoutSessionId = null
-            closePanel()
-            refreshOverlays()
-            toast("布局已保存并锁定")
         }
+        layoutSaveJob = saveJob
+        saveJob.start()
     }
 
     private fun cancelLayoutMode(silent: Boolean) {
         if (overlayMode != OverlayMode.LAYOUT) return
+        if (silent) {
+            layoutSaveJob?.cancel(CancellationException("布局因生命周期变化取消"))
+        }
         if (!layoutCommitGuard.cancel(force = silent)) {
             toast("布局正在保存，暂时不能取消")
             return
@@ -1053,13 +1221,19 @@ class ComboAccessibilityService : AccessibilityService() {
         layoutSession = null
         layoutTargetPackage = null
         selectedLayoutComboId = null
+        layoutStopSelected = false
         layoutSessionId = null
         closePanel()
+        removePlaybackStop()
         refreshOverlays()
         if (!silent) toast("已取消布局并恢复原位置")
     }
 
     private fun playCombo(combo: Combo) {
+        if (isLayoutPersistenceBlocked()) {
+            toast(layoutRecoveryFailure ?: "正在恢复布局，暂时不能执行连招")
+            return
+        }
         if (overlayMode != OverlayMode.LOCKED) return
         closePanel()
         if (!removeEditor()) {
@@ -1087,11 +1261,14 @@ class ComboAccessibilityService : AccessibilityService() {
                 refreshOverlays()
             }
             is PlaybackState.Running -> {
-                if (playbackStopView?.isAttachedToWindow != true && !showPlaybackStop(state.total)) {
+                if (playbackStopEntry?.root?.isAttachedToWindow != true &&
+                    !showPlaybackStop(state.total)
+                ) {
                     playbackEngine.stop("紧急停止按钮不可用，回放已终止")
                     return
                 }
-                playbackStopView?.text = "停止 ${state.repetition}/${state.total}"
+                playbackStopEntry?.root?.contentDescription =
+                    "紧急停止回放，第 ${state.repetition}/${state.total} 次"
             }
             is PlaybackState.Stopped -> {
                 delay(100L)
@@ -1122,36 +1299,151 @@ class ComboAccessibilityService : AccessibilityService() {
         return ExecutionGateResult.Allowed(display)
     }
 
-    private fun showPlaybackStop(total: Int): Boolean {
-        playbackStopView?.let { existing ->
-            if (existing.isAttachedToWindow) {
-                pendingOverlayRemovals.remove(existing)
-                return true
-            }
-            playbackStopView = null
-            playbackStopParams = null
-        }
+    private fun showPlaybackStop(total: Int, layoutPreview: Boolean = false): Boolean {
         val display = displaySnapshot()
-        val width = dp(120)
-        val height = dp(48)
-        val params = overlayParams(width, height).apply {
-            x = (display.width - width - dp(20)).coerceAtLeast(0)
-            y = dp(20)
+        val stopLayout = if (layoutPreview) {
+            layoutSession?.stopButtonLayout() ?: return false
+        } else {
+            StopButtonLayout(
+                x = settings.stopButtonX,
+                y = settings.stopButtonY,
+                sizeDp = settings.stopButtonSizeDp,
+            )
         }
-        val view = makePill("停止 1/$total", 0xFFD13C4B.toInt(), 14f).apply {
-            background = roundedBackground(0xF2D13C4B.toInt(), 24f)
+        val existing = playbackStopEntry
+        if (existing != null && existing.root.isAttachedToWindow) {
+            pendingOverlayRemovals.remove(existing.root)
+            applyStopButtonLayout(existing, stopLayout, display, layoutPreview, total)
+            return updateOverlayView(existing.root, existing.params)
+        }
+        if (existing != null) playbackStopEntry = null
+
+        val geometry = stopButtonGeometry(stopLayout, display, resources.displayMetrics.density)
+        val params = overlayParams(geometry.hitSizePx, geometry.hitSizePx)
+        val root = FrameLayout(this).apply {
+            isClickable = true
+            isFocusable = true
             elevation = dp(10).toFloat()
-            contentDescription = "紧急停止回放"
-            setOnClickListener { playbackEngine.stop("用户停止") }
         }
-        if (!attachOverlayView(view, params)) return false
-        playbackStopView = view
-        playbackStopParams = params
+        val visual = makePill("停", 0xFFD13C4B.toInt(), 14f).apply {
+            minimumWidth = 0
+            minimumHeight = 0
+            isClickable = false
+            isFocusable = false
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        }
+        val layoutRing = View(this).apply {
+            isClickable = false
+            isFocusable = false
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        }
+        root.addView(visual)
+        root.addView(layoutRing)
+        val entry = StopButtonEntry(root, visual, layoutRing, params)
+        applyStopButtonLayout(entry, stopLayout, display, layoutPreview, total)
+        if (!attachOverlayView(root, params)) return false
+        playbackStopEntry = entry
         return true
     }
 
+    private fun applyStopButtonLayout(
+        entry: StopButtonEntry,
+        layout: StopButtonLayout,
+        display: DisplaySnapshot,
+        layoutPreview: Boolean,
+        total: Int,
+    ) {
+        val geometry = stopButtonGeometry(layout, display, resources.displayMetrics.density)
+        entry.params.width = geometry.hitSizePx
+        entry.params.height = geometry.hitSizePx
+        entry.params.x = geometry.x
+        entry.params.y = geometry.y
+        entry.visual.layoutParams = FrameLayout.LayoutParams(
+            geometry.visualSizePx,
+            geometry.visualSizePx,
+            Gravity.CENTER,
+        )
+        entry.visual.background = stopButtonBackground()
+        entry.layoutRing.layoutParams = FrameLayout.LayoutParams(
+            geometry.visualSizePx,
+            geometry.visualSizePx,
+            Gravity.CENTER,
+        )
+        entry.layoutRing.visibility = if (layoutPreview) View.VISIBLE else View.GONE
+        entry.layoutRing.background = layoutRingBackground(layoutStopSelected)
+        entry.root.contentDescription = if (layoutPreview) {
+            "布局紧急停止键"
+        } else {
+            "紧急停止回放，第 1/$total 次"
+        }
+        if (entry.layoutPreview != layoutPreview) {
+            entry.layoutPreview = layoutPreview
+            if (layoutPreview) {
+                entry.root.setOnClickListener(null)
+                entry.root.setOnTouchListener(stopButtonLayoutTouchListener(entry.root, entry.params))
+            } else {
+                entry.root.setOnTouchListener(null)
+                entry.root.setOnClickListener { playbackEngine.stop("用户停止") }
+            }
+        }
+    }
+
+    private fun stopButtonLayoutTouchListener(
+        view: View,
+        params: WindowManager.LayoutParams,
+    ): View.OnTouchListener {
+        val drag = BallDragState(ViewConfiguration.get(this).scaledTouchSlop)
+        return View.OnTouchListener { _, event ->
+            if (overlayMode != OverlayMode.LAYOUT || layoutCommitGuard.isSaving(layoutSessionId)) {
+                return@OnTouchListener true
+            }
+            val display = displaySnapshot()
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    selectLayoutStopButton()
+                    drag.begin(event.rawX, event.rawY, params.x, params.y)
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    (drag.move(
+                        event.rawX,
+                        event.rawY,
+                        maxX = display.width - params.width,
+                        maxY = display.height - params.height,
+                    ) as? BallDragResult.Position)?.let { moved ->
+                        params.x = moved.x
+                        params.y = moved.y
+                        layoutSession?.moveStopButton(
+                            params.x / (display.width - params.width).coerceAtLeast(1).toFloat(),
+                            params.y / (display.height - params.height).coerceAtLeast(1).toFloat(),
+                        )
+                        updateOverlayView(view, params)
+                    }
+                    true
+                }
+                MotionEvent.ACTION_UP -> {
+                    drag.finish(params.x, params.y)
+                    true
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    (drag.cancel() as? BallDragResult.Position)?.let { rollback ->
+                        params.x = rollback.x
+                        params.y = rollback.y
+                        layoutSession?.moveStopButton(
+                            params.x / (display.width - params.width).coerceAtLeast(1).toFloat(),
+                            params.y / (display.height - params.height).coerceAtLeast(1).toFloat(),
+                        )
+                        updateOverlayView(view, params)
+                    }
+                    true
+                }
+                else -> false
+            }
+        }
+    }
+
     private fun playbackStopCenter(): PointF? {
-        val params = playbackStopParams ?: return null
+        val params = playbackStopEntry?.params ?: return null
         return PointF(params.x + params.width / 2f, params.y + params.height / 2f)
     }
 
@@ -1873,6 +2165,12 @@ class ComboAccessibilityService : AccessibilityService() {
             setStroke(dp(1), 0x66FFFFFF)
         }
 
+    private fun stopButtonBackground(): GradientDrawable = GradientDrawable().apply {
+        shape = GradientDrawable.OVAL
+        setColor(0xF2D13C4B.toInt())
+        setStroke(dp(1), 0x66FFFFFF)
+    }
+
     private fun layoutRingBackground(selected: Boolean): GradientDrawable =
         GradientDrawable().apply {
             shape = GradientDrawable.OVAL
@@ -1947,6 +2245,7 @@ class ComboAccessibilityService : AccessibilityService() {
 
     private fun removeBall(): Boolean {
         val view = ballView ?: return true
+        val params = ballParams
         // Fail closed: once recording/playback starts, an old ball must not remain interactive
         // even if WindowManager temporarily rejects physical removal during a display transition.
         ballView = null
@@ -1954,17 +2253,26 @@ class ComboAccessibilityService : AccessibilityService() {
         ballDragInProgress = false
         view.visibility = View.GONE
         view.isClickable = false
+        if (params != null) {
+            params.flags = params.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+            if (view.isAttachedToWindow) runCatching { windowManager.updateViewLayout(view, params) }
+        }
         return detachOverlayView(view)
     }
 
     private fun removePlaybackStop(): Boolean {
-        val view = playbackStopView ?: return true
-        val removed = detachOverlayView(view)
-        if (removed) {
-            playbackStopView = null
-            playbackStopParams = null
+        val entry = playbackStopEntry ?: return true
+        playbackStopEntry = null
+        entry.root.visibility = View.GONE
+        entry.root.isClickable = false
+        entry.root.isEnabled = false
+        // A failed physical detach must not leave an invisible touch-blocking overlay behind.
+        // Ask WindowManager to retire touchability before the best-effort removal/retry path.
+        entry.params.flags = entry.params.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        if (entry.root.isAttachedToWindow) {
+            runCatching { windowManager.updateViewLayout(entry.root, entry.params) }
         }
-        return removed
+        return detachOverlayView(entry.root)
     }
 
     private fun attachOverlayView(view: View, params: WindowManager.LayoutParams): Boolean {

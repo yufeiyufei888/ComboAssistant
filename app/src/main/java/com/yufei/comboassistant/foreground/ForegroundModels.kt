@@ -220,12 +220,22 @@ class SetBasedForegroundPackageClassifier(
     }
 
     companion object {
+        /**
+         * OEM hosts whose accessibility content events are also unsafe to treat as harmless
+         * content noise. These exact packages must remain transient for every observation kind.
+         */
+        val DEFAULT_FAIL_CLOSED_TRANSIENT_PACKAGES: Set<String> = setOf(
+            // HyperOS hosts both Security Center activities and Game Turbo surfaces here. Without
+            // an observed, version-stable class signature we cannot safely distinguish them.
+            "com.miui.securitycenter",
+        )
+
         val DEFAULT_TRANSIENT_PACKAGES: Set<String> = setOf(
             "android",
             "com.android.systemui",
             "com.android.permissioncontroller",
             "com.google.android.permissioncontroller",
-        )
+        ) + DEFAULT_FAIL_CLOSED_TRANSIENT_PACKAGES
 
         /**
          * OEM packages observed on HyperOS that emit window events for a screenshot/system UI
